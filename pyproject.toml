@@ -6,9 +6,15 @@ dependencies = [
     "anyio>=4.13.0",
     "dagger-io>=0.20.6",
     "dlt[filesystem,parquet]>=1.25.0",
+    "duckdb>=1.5.2",
+    "hotdata",
     "opentelemetry-exporter-otlp-proto-grpc>=1.41.1",
+    "pandas>=3.0.2",
     "pyarrow>=24.0.0",
 ]
+
+[tool.uv.sources]
+hotdata = { path = "../sdk-python", editable = true }
 
 [tool.black]
 target-version = ["py313"]
