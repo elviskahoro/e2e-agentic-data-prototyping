@@ -128,7 +128,6 @@ class Pipeline:
                 "setup.py",
                 "setup.cfg",
                 "README.md",
-                "requirements.txt",
             ],
         )
         return (
@@ -136,7 +135,6 @@ class Pipeline:
             .from_("ghcr.io/astral-sh/uv:python3.13-bookworm-slim")
             .with_mounted_cache("/root/.cache/uv", dag.cache_volume("dlt-datagen-uv"))
             .with_env_variable("UV_LINK_MODE", "copy")
-            .with_mounted_directory("/hotdata_sdk", hotdata_sdk)
             .with_exec(
                 [
                     "uv",
@@ -146,8 +144,16 @@ class Pipeline:
                     "dlt[duckdb]",
                     "duckdb",
                     "pyarrow",
-                    "/hotdata_sdk",
+                    # SDK runtime deps, installed here so the SDK layer can use --no-deps.
+                    "urllib3>=2.1.0,<3.0.0",
+                    "python-dateutil>=2.8.2",
+                    "pydantic>=2",
+                    "typing-extensions>=4.7.1",
                 ]
+            )
+            .with_mounted_directory("/hotdata_sdk", hotdata_sdk)
+            .with_exec(
+                ["uv", "pip", "install", "--system", "--no-deps", "/hotdata_sdk"]
             )
             .with_mounted_directory("/app/dlt_datagen", datagen_pkg)
             .with_mounted_file("/app/entry.py", entry_file)
