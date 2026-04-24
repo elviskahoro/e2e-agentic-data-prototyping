@@ -19,7 +19,7 @@ from hotdata.models.create_dataset_request import CreateDatasetRequest
 from hotdata.models.dataset_source import DatasetSource
 from hotdata.models.upload_dataset_source import UploadDatasetSource
 
-from dlt_datagen.load import customers, purchases
+from dlt_datagen.load import datagen_source
 
 TABLES = ("purchases", "customers")
 
@@ -92,7 +92,7 @@ def main() -> None:
         destination=dlt.destinations.duckdb(db),
         dataset_name=dataset_name,
     )
-    info = pipe.run([purchases(), customers()])
+    info = pipe.run(datagen_source())
     print(f"dlt load info: {info}", file=sys.stderr)
 
     cfg = hotdata.Configuration(access_token=api_key, host=host)
