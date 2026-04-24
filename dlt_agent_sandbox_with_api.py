@@ -40,9 +40,7 @@ class HotdataSession:
     def __enter__(self) -> "HotdataSession":
         cfg = hotdata.Configuration(access_token=self._api_key, host=self._host)
         with hotdata.ApiClient(cfg) as boot:
-            workspaces = (
-                hotdata.WorkspacesApi(boot).list_workspaces().workspaces or []
-            )
+            workspaces = hotdata.WorkspacesApi(boot).list_workspaces().workspaces or []
             if not workspaces:
                 raise RuntimeError("No workspaces available for this API key.")
             ws = next((w for w in workspaces if w.active), workspaces[0])
@@ -63,9 +61,7 @@ class HotdataSession:
         if self._client_cm is not None:
             self._client_cm.__exit__(*exc)
 
-    def _raw_json(
-        self, method: str, path: str, body: object | None = None
-    ) -> dict:
+    def _raw_json(self, method: str, path: str, body: object | None = None) -> dict:
         """Call an endpoint the generated SDK does not expose yet, using the SDK's auth + base URL."""
         headers: dict[str, str] = {"Accept": "application/json"}
         if body is not None:
