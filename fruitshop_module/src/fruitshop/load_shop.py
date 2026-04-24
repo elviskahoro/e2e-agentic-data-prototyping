@@ -19,7 +19,9 @@ def purchases():
             "customer_id": random.randint(1, 10),
             "inventory_id": random.randint(1, 6),
             "quantity": random.randint(1, 5),
-            "date": (start_date + timedelta(days=random.randint(0, 13))).strftime("%Y-%m-%d"),
+            "date": (start_date + timedelta(days=random.randint(0, 13))).strftime(
+                "%Y-%m-%d"
+            ),
         }
         for i in range(10)
     ]
