@@ -1,0 +1,11 @@
+[project]
+name = "fruitshop-demo"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "anyio>=4.13.0",
+    "dagger-io>=0.20.6",
+    "dlt[filesystem,parquet]>=1.25.0",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.41.1",
+    "pyarrow>=24.0.0",
+]
