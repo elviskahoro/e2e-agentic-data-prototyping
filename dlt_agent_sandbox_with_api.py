@@ -9,6 +9,7 @@ import secrets
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import dagger
 import hotdata
@@ -22,36 +23,86 @@ HOTDATA_SDK_PATH = PROJECT_ROOT.parent / "sdk-python"
 CONTAINER_ENTRY = PROJECT_ROOT / "dlt_agent_container_entry.py"
 
 
-def _pick_active_workspace(api_client: ApiClient) -> hotdata.WorkspaceListItem:
-    resp = hotdata.WorkspacesApi(api_client).list_workspaces()
-    workspaces = resp.workspaces or []
-    if not workspaces:
-        raise RuntimeError("No workspaces available for this API key.")
-    return next((w for w in workspaces if w.active), workspaces[0])
+class HotdataSession:
+    """Workspace-scoped Hotdata API client with helpers for endpoints the generated SDK doesn't expose, plus sandbox + verify operations.
 
+    Used as a context manager: opens a bootstrap client to pick the active workspace, then a persistent workspace-scoped client. After `create_sandbox`, all subsequent calls are scoped to that sandbox via `X-Sandbox-Id` / `X-Session-Id`.
+    """
 
-def _raw_json_call(
-    api_client: ApiClient,
-    method: str,
-    path: str,
-    body: object | None = None,
-) -> dict:
-    """Call an endpoint the generated SDK does not expose yet, using the SDK's auth + base URL."""
-    headers: dict[str, str] = {"Accept": "application/json"}
-    if body is not None:
-        headers["Content-Type"] = "application/json"
-    req = api_client.param_serialize(
-        method=method,
-        resource_path=path,
-        header_params=headers,
-        body=body,
-        auth_settings=["BearerAuth"],
-    )
-    resp = api_client.call_api(*req)
-    resp.read()
-    if resp.status >= 400:
-        raise RuntimeError(f"{method} {path} → {resp.status}: {resp.data!r}")
-    return json.loads(resp.data) if resp.data else {}
+    def __init__(self, api_key: str, host: str):
+        self._api_key = api_key
+        self._host = host
+        self._client_cm: Any = None
+        self.api_client: ApiClient
+        self.workspace_id: str = ""
+        self.sandbox_id: str = ""
+
+    def __enter__(self) -> "HotdataSession":
+        cfg = hotdata.Configuration(access_token=self._api_key, host=self._host)
+        with hotdata.ApiClient(cfg) as boot:
+            workspaces = (
+                hotdata.WorkspacesApi(boot).list_workspaces().workspaces or []
+            )
+            if not workspaces:
+                raise RuntimeError("No workspaces available for this API key.")
+            ws = next((w for w in workspaces if w.active), workspaces[0])
+
+        self.workspace_id = ws.public_id
+        print(f"→ using workspace {ws.public_id} ({ws.name})", file=sys.stderr)
+
+        # The generated SDK does not wire X-Workspace-Id into per-operation
+        # auth_settings, so we attach it as a default header on a long-lived client.
+        self._client_cm = hotdata.ApiClient(
+            hotdata.Configuration(access_token=self._api_key, host=self._host)
+        )
+        self.api_client = self._client_cm.__enter__()
+        self.api_client.set_default_header("X-Workspace-Id", ws.public_id)
+        return self
+
+    def __exit__(self, *exc) -> None:
+        if self._client_cm is not None:
+            self._client_cm.__exit__(*exc)
+
+    def _raw_json(
+        self, method: str, path: str, body: object | None = None
+    ) -> dict:
+        """Call an endpoint the generated SDK does not expose yet, using the SDK's auth + base URL."""
+        headers: dict[str, str] = {"Accept": "application/json"}
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+        req = self.api_client.param_serialize(
+            method=method,
+            resource_path=path,
+            header_params=headers,
+            body=body,
+            auth_settings=["BearerAuth"],
+        )
+        resp = self.api_client.call_api(*req)
+        resp.read()
+        if resp.status >= 400:
+            raise RuntimeError(f"{method} {path} → {resp.status}: {resp.data!r}")
+        return json.loads(resp.data) if resp.data else {}
+
+    def create_sandbox(self, name: str) -> str:
+        body = self._raw_json("POST", "/v1/sandboxes", {"name": name})
+        sandbox = body.get("sandbox", body)
+        self.sandbox_id = sandbox["public_id"]
+        # X-Sandbox-Id scopes dataset writes; X-Session-Id scopes query reads.
+        self.api_client.set_default_header("X-Sandbox-Id", self.sandbox_id)
+        self.api_client.set_default_header("X-Session-Id", self.sandbox_id)
+        print(f"→ created sandbox {self.sandbox_id}", file=sys.stderr)
+        return self.sandbox_id
+
+    def preview(self, tables: list[str]) -> dict[str, list[list[object]]]:
+        """Preview rows from each uploaded table to confirm the load."""
+        query_api = hotdata.QueryApi(self.api_client)
+        results: dict[str, list[list[object]]] = {}
+        for table in sorted(set(tables)):
+            sql = f"SELECT * FROM datasets.{self.sandbox_id}.{table} LIMIT 10"
+            print(f"→ query {sql!r}", file=sys.stderr)
+            resp = query_api.query(QueryRequest(sql=sql))
+            results[table] = [[*resp.columns]] + [list(r) for r in (resp.rows or [])]
+        return results
 
 
 @object_type
@@ -67,7 +118,10 @@ class Pipeline:
         api_url: str,
     ) -> dagger.Container:
         """Build the container that runs dlt in-memory and uploads straight to the Hotdata API."""
-        datagen_src = dag.host().directory(str(MODULE_PATH), include=["src/**"])
+        # Mount the package directly at /app/dlt_datagen so `python /app/entry.py`
+        # picks it up via the script-dir entry on sys.path — no PYTHONPATH or
+        # sys.path manipulation needed in the container entry.
+        datagen_pkg = dag.host().directory(str(MODULE_PATH / "src" / "dlt_datagen"))
         entry_file = dag.host().file(str(CONTAINER_ENTRY))
         # Only the files pip needs to install the editable SDK as a regular package.
         hotdata_sdk = dag.host().directory(
@@ -99,7 +153,7 @@ class Pipeline:
                     "/hotdata_sdk",
                 ]
             )
-            .with_mounted_directory("/app", datagen_src)
+            .with_mounted_directory("/app/dlt_datagen", datagen_pkg)
             .with_mounted_file("/app/entry.py", entry_file)
             .with_workdir("/app")
             .with_env_variable("DLT_DATAGEN_RUN_ID", self.run_id)
@@ -110,27 +164,11 @@ class Pipeline:
             .with_exec(["python", "/app/entry.py"])
         )
 
-
-def _parse_tables_from_stdout(stdout: str) -> list[str]:
-    """Container's last stdout line is a JSON object with the created table names."""
-    last = stdout.strip().splitlines()[-1]
-    return list(json.loads(last)["tables"])
-
-
-def verify(
-    api_client: ApiClient,
-    sandbox_id: str,
-    tables: list[str],
-) -> dict[str, list[list[object]]]:
-    """Preview rows from each uploaded table to confirm the load."""
-    query_api = hotdata.QueryApi(api_client)
-    results: dict[str, list[list[object]]] = {}
-    for table in sorted(set(tables)):
-        sql = f"SELECT * FROM datasets.{sandbox_id}.{table} LIMIT 10"
-        print(f"→ query {sql!r}", file=sys.stderr)
-        resp = query_api.query(QueryRequest(sql=sql))
-        results[table] = [[*resp.columns]] + [list(r) for r in (resp.rows or [])]
-    return results
+    @staticmethod
+    def parse_tables(stdout: str) -> list[str]:
+        """Container's last stdout line is a JSON object with the created table names."""
+        last = stdout.strip().splitlines()[-1]
+        return list(json.loads(last)["tables"])
 
 
 def _format_preview(columns_plus_rows: list[list[object]]) -> str:
@@ -140,8 +178,8 @@ def _format_preview(columns_plus_rows: list[list[object]]) -> str:
 
 
 async def main() -> None:
-    api_key_val = os.environ.get("HOTDATA_API_KEY")
-    if not api_key_val:
+    api_key = os.environ.get("HOTDATA_API_KEY")
+    if not api_key:
         raise RuntimeError(
             "HOTDATA_API_KEY must be set (export HOTDATA_API_KEY=...) before running."
         )
@@ -153,46 +191,24 @@ async def main() -> None:
     # /v1/files) are only routed on api.hotdata.dev — matching the CLI default.
     host = os.environ.get("HOTDATA_API_URL", "https://api.hotdata.dev")
 
-    # First pass: pick workspace with an un-scoped client.
-    bootstrap_cfg = hotdata.Configuration(access_token=api_key_val, host=host)
-    with hotdata.ApiClient(bootstrap_cfg) as boot_client:
-        ws = _pick_active_workspace(boot_client)
-    print(f"→ using workspace {ws.public_id} ({ws.name})", file=sys.stderr)
+    with HotdataSession(api_key, host) as session:
+        sandbox_id = session.create_sandbox(f"agent_{run_id}")
 
-    # Second pass: workspace-scoped client, creates a sandbox and pins X-Sandbox-Id
-    # for the remainder of the run. The generated SDK does not wire X-Workspace-Id
-    # into per-operation auth_settings, so we attach it as a default header.
-    cfg = hotdata.Configuration(access_token=api_key_val, host=host)
-    with hotdata.ApiClient(cfg) as api_client:
-        api_client.set_default_header("X-Workspace-Id", ws.public_id)
-        sandbox_body = _raw_json_call(
-            api_client,
-            "POST",
-            "/v1/sandboxes",
-            {"name": f"agent_{run_id}"},
-        )
-        sandbox = sandbox_body.get("sandbox", sandbox_body)
-        sandbox_id = sandbox["public_id"]
-        print(f"→ created sandbox {sandbox_id}", file=sys.stderr)
-        # Both headers are needed: X-Sandbox-Id scopes dataset writes to the
-        # sandbox, X-Session-Id scopes query reads to the same session.
-        api_client.set_default_header("X-Sandbox-Id", sandbox_id)
-        api_client.set_default_header("X-Session-Id", sandbox_id)
-
-        cfg_dagger = dagger.Config(log_output=sys.stderr)
-        async with dagger.connection(cfg_dagger):
-            api_key_secret = dag.set_secret("hotdata-api-key", api_key_val)
+        async with dagger.connection(dagger.Config(log_output=sys.stderr)):
+            api_key_secret = dag.set_secret("hotdata-api-key", api_key)
             pipeline = Pipeline(
-                run_id=run_id, workspace_id=ws.public_id, sandbox_id=sandbox_id
+                run_id=run_id,
+                workspace_id=session.workspace_id,
+                sandbox_id=sandbox_id,
             )
             stdout = await pipeline.run_in_container(api_key_secret, host).stdout()
 
-        tables = _parse_tables_from_stdout(stdout)
+        tables = Pipeline.parse_tables(stdout)
         print(f"→ container uploaded tables: {tables}", file=sys.stderr)
-        verify_results = verify(api_client, sandbox_id, tables)
+        previews = session.preview(tables)
 
     print("\n=== preview ===", flush=True)
-    for table, rows in verify_results.items():
+    for table, rows in previews.items():
         print(f"[{table}]\n{_format_preview(rows)}\n", flush=True)
 
 
