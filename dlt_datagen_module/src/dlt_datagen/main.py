@@ -8,6 +8,7 @@ OUTPUT_DIR = "/workspace/output"
 
 @object_type
 class DltDatagen:
+
     @function
     def load(self) -> dagger.Directory:
         """Run the dlt datagen pipeline in a container and return the parquet output directory."""
