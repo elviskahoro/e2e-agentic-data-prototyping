@@ -1,4 +1,4 @@
-"""dlt load for fruitshop purchases. Runs inside the Dagger-spawned container, writes parquet to /workspace/output."""
+"""dlt load for synthetic purchases and customers. Runs inside the Dagger-spawned container, writes parquet to /workspace/output."""
 
 import os
 import random
@@ -37,8 +37,8 @@ def customers():
     ]
 
 
-def load_shop() -> None:
-    run_id = os.environ["FRUITSHOP_RUN_ID"]
+def load() -> None:
+    run_id = os.environ["DLT_DATAGEN_RUN_ID"]
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     p = dlt.pipeline(
         pipeline_name=f"agent_{run_id}",
@@ -49,4 +49,4 @@ def load_shop() -> None:
 
 
 if __name__ == "__main__":
-    load_shop()
+    load()

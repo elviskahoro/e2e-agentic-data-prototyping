@@ -1,4 +1,4 @@
-"""Host driver: run the Fruitshop Dagger module, upload parquet to a per-run Hotdata sandbox, verify with a query. Uses the Dagger Python SDK end to end — no subprocess."""
+"""Host driver: run the DltDatagen Dagger module, upload parquet to a per-run Hotdata sandbox, verify with a query. Uses the Dagger Python SDK end to end — no subprocess."""
 
 # mypy: disable-error-code="no-untyped-def,arg-type"
 
@@ -16,9 +16,9 @@ import dagger
 from dagger import Container, Directory, Doc, Secret, dag, function, object_type
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-MODULE_PATH = PROJECT_ROOT / "fruitshop_module"
-OUTPUT_ROOT = PROJECT_ROOT / "_dagger_output" / "fruitshop"
-FRUITSHOP_OUTPUT_DIR = "/workspace/output"
+MODULE_PATH = PROJECT_ROOT / "dlt_datagen_module"
+OUTPUT_ROOT = PROJECT_ROOT / "_dagger_output" / "dlt_datagen"
+DLT_DATAGEN_OUTPUT_DIR = "/workspace/output"
 
 HOTDATA_INSTALLER_URL = "https://github.com/hotdata-dev/hotdata-cli/releases/latest/download/hotdata-cli-installer.sh"
 
@@ -101,13 +101,13 @@ class Pipeline:
         return self
 
     @function
-    def load_fruitshop(self) -> Directory:
-        """Run the Fruitshop dlt pipeline in a container and return the parquet output directory."""
+    def load_dlt_datagen(self) -> Directory:
+        """Run the dlt datagen pipeline in a container and return the parquet output directory."""
         source = dag.host().directory(str(MODULE_PATH), include=["src/**"])
         return (
             dag.container()
             .from_("ghcr.io/astral-sh/uv:python3.13-bookworm-slim")
-            .with_mounted_cache("/root/.cache/uv", dag.cache_volume("fruitshop-uv"))
+            .with_mounted_cache("/root/.cache/uv", dag.cache_volume("dlt-datagen-uv"))
             .with_env_variable("UV_LINK_MODE", "copy")
             .with_exec(
                 [
@@ -121,9 +121,9 @@ class Pipeline:
             )
             .with_mounted_directory("/app", source)
             .with_workdir("/app")
-            .with_env_variable("FRUITSHOP_RUN_ID", self.run_id)
-            .with_exec(["python", "src/fruitshop/load_shop.py"])
-            .directory(FRUITSHOP_OUTPUT_DIR)
+            .with_env_variable("DLT_DATAGEN_RUN_ID", self.run_id)
+            .with_exec(["python", "src/dlt_datagen/load.py"])
+            .directory(DLT_DATAGEN_OUTPUT_DIR)
         )
 
     @function
@@ -180,18 +180,16 @@ class Pipeline:
     @function
     async def verify(
         self,
-        tables: Annotated[
-            list[str], Doc("Table names to verify with a COUNT(*) query")
-        ],
-    ) -> None:
-        """Run a COUNT(*) query against each uploaded table to confirm the load."""
+        tables: Annotated[list[str], Doc("Table names to preview with a SELECT query")],
+    ) -> dict[str, str]:
+        """Preview rows from each uploaded table to confirm the load."""
+        results: dict[str, str] = {}
         for table in sorted(set(tables)):
-            sql = (
-                f"SELECT COUNT(*) AS row_count FROM datasets.{self.sandbox_id}.{table}"
-            )
+            sql = f"SELECT * FROM datasets.{self.sandbox_id}.{table} LIMIT 10"
             print(f"→ hotdata query {sql!r}", file=sys.stderr)
             out = await _exec(self.ctr, ["hotdata", "query", sql]).stdout()
-            print(out)
+            results[table] = out.rstrip()
+        return results
 
 
 async def main() -> None:
@@ -212,10 +210,14 @@ async def main() -> None:
         pipeline = await pipeline.create_sandbox()
 
         export_dir.parent.mkdir(parents=True, exist_ok=True)
-        await pipeline.load_fruitshop().export(str(export_dir))
+        await pipeline.load_dlt_datagen().export(str(export_dir))
 
         tables = await pipeline.upload_parquets(export_dir)
-        await pipeline.verify(tables)
+        verify_results = await pipeline.verify(tables)
+
+    print("\n=== preview ===", flush=True)
+    for table, out in verify_results.items():
+        print(f"[{table}]\n{out}\n", flush=True)
 
 
 if __name__ == "__main__":
