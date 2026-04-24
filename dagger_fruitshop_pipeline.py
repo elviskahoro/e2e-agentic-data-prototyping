@@ -5,9 +5,10 @@
 import asyncio
 import json
 import os
+import secrets
 import shlex
 import sys
-from datetime import datetime
+import time
 from pathlib import Path
 from typing import Annotated, Self
 
@@ -79,7 +80,7 @@ class Pipeline:
 
     @function
     async def create_sandbox(self) -> Self:
-        """Create a per-run Hotdata sandbox and attach it to the container env."""
+        """Create a per-run Hotdata sandbox and attach it to the container env. Sandbox name matches the dlt dataset name."""
         stdout = await _exec(
             self.ctr,
             [
@@ -87,7 +88,7 @@ class Pipeline:
                 "sandbox",
                 "new",
                 "--name",
-                f"fruitshop-{self.run_id}",
+                f"agent_{self.run_id}",
                 "--output",
                 "json",
             ],
@@ -120,6 +121,7 @@ class Pipeline:
             )
             .with_mounted_directory("/app", source)
             .with_workdir("/app")
+            .with_env_variable("FRUITSHOP_RUN_ID", self.run_id)
             .with_exec(["python", "src/fruitshop/load_shop.py"])
             .directory(FRUITSHOP_OUTPUT_DIR)
         )
@@ -128,23 +130,23 @@ class Pipeline:
     async def upload_parquets(
         self,
         export_dir: Annotated[
-            Path, Doc("Host directory containing exported parquet files")
+            Path, Doc("Host directory containing this run's exported parquet output")
         ],
     ) -> list[str]:
-        """Upload every parquet under export_dir into the current sandbox, returning the table names."""
+        """Upload every parquet under this run's dataset dir into the sandbox, returning the table names."""
+        dataset_dir = export_dir / f"agent_{self.run_id}"
         parquet_files = sorted(
             p
-            for p in export_dir.rglob("*.parquet")
+            for p in dataset_dir.rglob("*.parquet")
             if not any(part.startswith("_dlt_") for part in p.parts)
         )
         if not parquet_files:
-            raise RuntimeError(f"No parquet files under {export_dir}")
+            raise RuntimeError(f"No parquet files under {dataset_dir}")
 
         table_names: list[str] = []
         for pq in parquet_files:
             table_name = pq.parent.name
-            load_id = pq.stem.rsplit(".", 1)[0]
-            label = f"fruitshop_{table_name}_load_{load_id}"
+            label = f"agent_{self.run_id}_{table_name}"
             print(
                 f"→ hotdata datasets create --label {label} --table-name {table_name}",
                 file=sys.stderr,
@@ -199,7 +201,7 @@ async def main() -> None:
             "HOTDATA_API_KEY must be set (export HOTDATA_API_KEY=...) before running."
         )
 
-    run_id = datetime.now().strftime("%Y%m%dT%H%M%S")
+    run_id = f"{int(time.time() * 1000):012x}{secrets.token_hex(10)}"
     export_dir = OUTPUT_ROOT / run_id
     print(f"→ run {run_id} → {export_dir}", file=sys.stderr)
 

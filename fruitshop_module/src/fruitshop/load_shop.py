@@ -1,5 +1,6 @@
 """dlt load for fruitshop purchases. Runs inside the Dagger-spawned container, writes parquet to /workspace/output."""
 
+import os
 import random
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -27,14 +28,24 @@ def purchases():
     ]
 
 
+@dlt.resource(primary_key="id")
+def customers():
+    yield [
+        {"id": 1, "name": "Alice", "city": "Berlin"},
+        {"id": 2, "name": "Bob", "city": "Lisbon"},
+        {"id": 3, "name": "Carol", "city": "Taipei"},
+    ]
+
+
 def load_shop() -> None:
+    run_id = os.environ["FRUITSHOP_RUN_ID"]
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     p = dlt.pipeline(
-        pipeline_name="fruitshop_parquet",
+        pipeline_name=f"agent_{run_id}",
         destination=dlt.destinations.filesystem(bucket_url=OUTPUT_DIR.as_uri()),
-        dataset_name="fruitshop_data",
+        dataset_name=f"agent_{run_id}",
     )
-    p.run(purchases(), loader_file_format="parquet")
+    p.run([purchases(), customers()], loader_file_format="parquet")
 
 
 if __name__ == "__main__":
