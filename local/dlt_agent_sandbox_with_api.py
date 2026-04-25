@@ -126,7 +126,11 @@ class Pipeline:
             .with_env_variable("UV_LINK_MODE", "copy")
             # uv needs git to install hotdata from a GitHub source.
             .with_exec(
-                ["sh", "-c", "apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*"]
+                [
+                    "sh",
+                    "-c",
+                    "apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*",
+                ]
             )
             .with_exec(
                 [
