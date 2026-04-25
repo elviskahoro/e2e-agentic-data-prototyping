@@ -17,7 +17,6 @@ from hotdata.models.query_request import QueryRequest
 SANDBOX_DIR = Path(__file__).resolve().parent
 APP_NAME = "dlt-datagen-demo"
 SANDBOX_TIMEOUT_SECONDS = 600
-HOTDATA_SDK_REF = "d3806b6a5d49"
 
 
 class HotdataSession:
@@ -111,14 +110,8 @@ image = (
         "UV_LINK_MODE=copy uv pip install --system 'dlt[duckdb]' duckdb pyarrow '/tmp/sdk'"
     )
     .workdir("/app")
-    .add_local_dir(
-        str(SANDBOX_DIR / "dlt_datagen_module" / "src" / "dlt_datagen"),
-        "/app/dlt_datagen",
-        ignore=["__pycache__"],
-        copy=False,
-    )
     .add_local_file(
-        str(SANDBOX_DIR / "dlt_datagen_module" / "src" / "dlt_datagen" / "load.py"),
+        str(SANDBOX_DIR / "source.py"),
         "/app/source.py",
         copy=False,
     )

@@ -38,34 +38,23 @@ Subsequent runs: **fast** (under 1 minute). The pip layer is cached; only contai
 
 ## Updating the Hotdata SDK
 
-The SDK is pinned to a git ref in two places. **They must match:**
-
-1. **In the host driver** — `dlt_agent_sandbox_with_modal.py`, line ~20:
-   ```python
-   HOTDATA_SDK_REF = "main"
-   ```
-
-2. **In the host dependencies** — `sandbox/pyproject.toml`:
-   ```toml
-   "hotdata @ git+https://github.com/hotdata-dev/sdk-python@main",
-   ```
+The SDK is pinned in `pyproject.toml`:
+```toml
+"hotdata @ git+https://github.com/hotdata-dev/sdk-python@d3806b6a5d49",
+```
 
 **To bump the SDK:**
 1. Choose a new ref: `"main"`, a short commit SHA, or a tag like `"v0.x.y"`.
-2. Update **both** lines above to the same ref.
-3. Run `uv sync` to fetch the new SDK from GitHub (this validates the ref).
-4. Run `uv run python dlt_agent_sandbox_with_modal.py` to trigger an image rebuild.
-
-The **host install** happens at `uv sync` time and won't automatically pick up changes to the Python constant in the driver — you must update `pyproject.toml` too.
-
-**Why two places?** Modal caches image layers by command string. A mismatch between the host and container SDK versions can cause subtle bugs (host code uses features the container SDK doesn't have, or vice versa). Pinning both to the same ref string ensures they diverge only when you intentionally change them together.
+2. Update the ref in `pyproject.toml`.
+3. Run `uv sync` to fetch the new SDK from GitHub.
+4. Run `uv run python dlt_agent_sandbox_with_modal.py` to trigger a Modal image rebuild.
 
 ## Architecture
 
 - **dlt_agent_sandbox_with_modal.py** — Host driver. Creates a Hotdata sandbox, spawns a Modal Sandbox to run dlt in-memory, uploads the results, and fetches a preview.
-- **dlt_agent_container_entry.py** — Container entry point (unchanged from Dagger version). Runs dlt, pipes parquet bytes to Hotdata API, prints JSON summary to stdout.
-- **dlt_datagen_module/src/dlt_datagen/** — Synthetic data source. Agents can modify `load.py` to change generated data.
-- **pyproject.toml** (both host and module) — Dependencies. Host installs `modal` and `hotdata` from GitHub; the module is pip-installable but runtime deps are baked into the image.
+- **dlt_agent_container_entry.py** — Container entry point. Runs dlt, pipes parquet bytes to Hotdata API, prints JSON summary to stdout.
+- **source.py** — Synthetic data source defined as a dlt source. Modify this to change the generated data.
+- **pyproject.toml** — Dependencies. Host installs `modal` and `hotdata` from GitHub.
 
 ## Details
 
