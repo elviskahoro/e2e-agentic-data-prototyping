@@ -1,0 +1,8 @@
+[project]
+name = "dlt-agent-sandbox-modal-demo"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "modal>=0.66",
+    "hotdata @ git+https://github.com/hotdata-dev/sdk-python@d3806b6a5d49",
+]
