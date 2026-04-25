@@ -81,26 +81,58 @@ class Uploader:
 def main() -> None:
     api_key = os.environ["HOTDATA_API_KEY"]
     host = os.environ["HOTDATA_API_URL"]
-    workspace_id = os.environ["HOTDATA_WORKSPACE_ID"]
-    sandbox_id = os.environ["HOTDATA_SANDBOX_ID"]
     run_id = os.environ["DLT_DATAGEN_RUN_ID"]
-
-    db = duckdb.connect(":memory:")
-    dataset_name = f"agent_{run_id}"
-    pipe = dlt.pipeline(
-        pipeline_name=dataset_name,
-        destination=dlt.destinations.duckdb(db),
-        dataset_name=dataset_name,
-    )
-    info = pipe.run(datagen_source())
-    print(f"dlt load info: {info}", file=sys.stderr)
 
     cfg = hotdata.Configuration(access_token=api_key, host=host)
     with hotdata.ApiClient(cfg) as api_client:
+        # Get active workspace
+        workspaces = hotdata.WorkspacesApi(api_client).list_workspaces().workspaces or []
+        if not workspaces:
+            raise RuntimeError("No workspaces available for this API key.")
+        ws = next((w for w in workspaces if w.active), workspaces[0])
+        workspace_id = ws.public_id
+        print(f"→ using workspace {ws.public_id} ({ws.name})", file=sys.stderr)
+
         api_client.set_default_header("X-Workspace-Id", workspace_id)
+
+        # Create sandbox
+        def _raw_json(method: str, path: str, body: object | None = None) -> dict:
+            headers: dict[str, str] = {"Accept": "application/json"}
+            if body is not None:
+                headers["Content-Type"] = "application/json"
+            req = api_client.param_serialize(
+                method=method,
+                resource_path=path,
+                header_params=headers,
+                body=body,
+                auth_settings=["BearerAuth"],
+            )
+            resp = api_client.call_api(*req)
+            resp.read()
+            if resp.status >= 400:
+                raise RuntimeError(f"{method} {path} → {resp.status}: {resp.data!r}")
+            return json.loads(resp.data) if resp.data else {}
+
+        body = _raw_json("POST", "/v1/sandboxes", {"name": f"agent_{run_id}"})
+        sandbox = body.get("sandbox", body)
+        sandbox_id = sandbox["public_id"]
+        print(f"→ created sandbox {sandbox_id}", file=sys.stderr)
+
         api_client.set_default_header("X-Sandbox-Id", sandbox_id)
         api_client.set_default_header("X-Session-Id", sandbox_id)
 
+        # Run dlt pipeline
+        db = duckdb.connect(":memory:")
+        dataset_name = f"agent_{run_id}"
+        pipe = dlt.pipeline(
+            pipeline_name=dataset_name,
+            destination=dlt.destinations.duckdb(db),
+            dataset_name=dataset_name,
+        )
+        info = pipe.run(datagen_source())
+        print(f"dlt load info: {info}", file=sys.stderr)
+
+        # Upload to sandbox
         uploader = Uploader(api_client)
         ds = pipe.dataset()
         for table_name in TABLES:
@@ -110,7 +142,7 @@ def main() -> None:
                 label=f"agent_{run_id}_{table_name}",
             )
 
-    print(json.dumps({"tables": list(TABLES)}))
+    print(json.dumps({"sandbox_id": sandbox_id, "tables": list(TABLES)}))
 
 
 if __name__ == "__main__":
