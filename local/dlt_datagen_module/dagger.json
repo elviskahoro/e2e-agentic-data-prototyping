@@ -1,7 +1,0 @@
-{
-  "name": "dlt_datagen",
-  "engineVersion": "v0.20.3",
-  "sdk": {
-    "source": "python"
-  }
-}

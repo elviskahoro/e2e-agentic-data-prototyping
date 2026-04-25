@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-hotdata = { path = "../sdk-python", editable = true }
+hotdata = { git = "https://github.com/hotdata-dev/sdk-python" }
 
 [tool.black]
 target-version = ["py313"]

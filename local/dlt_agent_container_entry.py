@@ -19,7 +19,7 @@ from hotdata.models.create_dataset_request import CreateDatasetRequest
 from hotdata.models.dataset_source import DatasetSource
 from hotdata.models.upload_dataset_source import UploadDatasetSource
 
-from dlt_datagen.load import datagen_source
+from source import datagen_source
 
 TABLES = ("purchases", "customers")
 

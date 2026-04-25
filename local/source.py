@@ -1,13 +1,9 @@
 """dlt source for synthetic purchases and customers. Agents may modify this file to change the generated data."""
 
-import os
 import random
 from datetime import datetime, timedelta
-from pathlib import Path
 
 import dlt
-
-OUTPUT_DIR = Path("/workspace/output")
 
 
 @dlt.source
@@ -38,18 +34,3 @@ def datagen_source():
         ]
 
     return [purchases, customers]
-
-
-def load() -> None:
-    run_id = os.environ["DLT_DATAGEN_RUN_ID"]
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    p = dlt.pipeline(
-        pipeline_name=f"agent_{run_id}",
-        destination=dlt.destinations.filesystem(bucket_url=OUTPUT_DIR.as_uri()),
-        dataset_name=f"agent_{run_id}",
-    )
-    p.run(datagen_source(), loader_file_format="parquet")
-
-
-if __name__ == "__main__":
-    load()

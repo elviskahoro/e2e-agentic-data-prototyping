@@ -18,8 +18,8 @@ from hotdata.api_client import ApiClient
 from hotdata.models.query_request import QueryRequest
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-MODULE_PATH = PROJECT_ROOT / "dlt_datagen_module"
-HOTDATA_SDK_PATH = PROJECT_ROOT.parent / "sdk-python"
+DATAGEN_SOURCE = PROJECT_ROOT / "source.py"
+HOTDATA_SDK_GIT = "git+https://github.com/hotdata-dev/sdk-python"
 CONTAINER_ENTRY = PROJECT_ROOT / "dlt_agent_container_entry.py"
 
 
@@ -114,27 +114,20 @@ class Pipeline:
         api_url: str,
     ) -> dagger.Container:
         """Build the container that runs dlt in-memory and uploads straight to the Hotdata API."""
-        # Mount the package directly at /app/dlt_datagen so `python /app/entry.py`
-        # picks it up via the script-dir entry on sys.path — no PYTHONPATH or
-        # sys.path manipulation needed in the container entry.
-        datagen_pkg = dag.host().directory(str(MODULE_PATH / "src" / "dlt_datagen"))
+        # Mount source.py and entry.py side-by-side at /app so the entry's
+        # `from source import datagen_source` resolves via the script-dir
+        # entry on sys.path — no PYTHONPATH or sys.path manipulation needed.
+        datagen_source_file = dag.host().file(str(DATAGEN_SOURCE))
         entry_file = dag.host().file(str(CONTAINER_ENTRY))
-        # Only the files pip needs to install the editable SDK as a regular package.
-        hotdata_sdk = dag.host().directory(
-            str(HOTDATA_SDK_PATH),
-            include=[
-                "hotdata/**",
-                "pyproject.toml",
-                "setup.py",
-                "setup.cfg",
-                "README.md",
-            ],
-        )
         return (
             dag.container()
             .from_("ghcr.io/astral-sh/uv:python3.13-bookworm-slim")
             .with_mounted_cache("/root/.cache/uv", dag.cache_volume("dlt-datagen-uv"))
             .with_env_variable("UV_LINK_MODE", "copy")
+            # uv needs git to install hotdata from a GitHub source.
+            .with_exec(
+                ["sh", "-c", "apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*"]
+            )
             .with_exec(
                 [
                     "uv",
@@ -144,18 +137,10 @@ class Pipeline:
                     "dlt[duckdb]",
                     "duckdb",
                     "pyarrow",
-                    # SDK runtime deps, installed here so the SDK layer can use --no-deps.
-                    "urllib3>=2.1.0,<3.0.0",
-                    "python-dateutil>=2.8.2",
-                    "pydantic>=2",
-                    "typing-extensions>=4.7.1",
+                    HOTDATA_SDK_GIT,
                 ]
             )
-            .with_mounted_directory("/hotdata_sdk", hotdata_sdk)
-            .with_exec(
-                ["uv", "pip", "install", "--system", "--no-deps", "/hotdata_sdk"]
-            )
-            .with_mounted_directory("/app/dlt_datagen", datagen_pkg)
+            .with_mounted_file("/app/source.py", datagen_source_file)
             .with_mounted_file("/app/entry.py", entry_file)
             .with_workdir("/app")
             .with_env_variable("DLT_DATAGEN_RUN_ID", self.run_id)
