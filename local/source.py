@@ -1,9 +1,5 @@
 """dlt source for synthetic purchases and customers — the swappable payload the runner imports.
 
-Contract with `container/runner.py`:
-- `PIPELINE_NAME: str` — used as both pipeline_name and dataset_name.
-- `source()` — callable returning a dlt source or resource.
-
 Agents may rewrite this file; the runner discovers tables from the dlt schema, so adding/removing resources here doesn't require changes to the runtime.
 """
 
@@ -12,10 +8,8 @@ from datetime import datetime, timedelta
 
 import dlt
 
-PIPELINE_NAME = "datagen"
 
-
-@dlt.source
+@dlt.source(name="datagen")
 def source():
     @dlt.resource(primary_key="id")
     def purchases():

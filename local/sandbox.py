@@ -32,18 +32,18 @@ import dagger
 from dagger import dag
 
 from pipeline_runtime import (
-    AGENT_OWNER,
+    ClaudeImage,
+    DatagenImage,
     HotdataSession,
-    add_hotdata_env,
-    build_claude_container,
-    build_datagen_container,
+    Runner,
     host_file,
-    mount_runner,
-    parse_runner_summary,
 )
+
+os.environ.setdefault("DAGGER_NO_NAG", "1")
 
 DEFAULT_MODEL = "claude-haiku-4-5"
 DEFAULT_EFFORT = "low"
+PREVIEW_COLS = 5
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DATA_DIR = SCRIPT_DIR / "data"
@@ -64,9 +64,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     p.add_argument(
         "--with-prompt",
         type=Path,
+        nargs="?",
         default=None,
+        const=Path("prompt.md"),
         metavar="PROMPT_FILE",
-        help="Path to a prompt file. If set, switches from the default datagen flow to the Claude flow (modifies source.py via the agent before the runner uploads).",
+        help="Path to a prompt file. If set, switches from the default datagen flow to the Claude flow (modifies source.py via the agent before the runner uploads). Bare flag defaults to prompt.md.",
     )
     p.add_argument(
         "--name",
@@ -93,186 +95,235 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def _format_preview(columns_plus_rows: list[list[object]]) -> str:
-    return "\n".join(
-        "\t".join("" if v is None else str(v) for v in r) for r in columns_plus_rows
-    )
+class BaseFlow:
+    """Shared skeleton: open Hotdata session, build & run the trusted runner, preview tables.
 
+    Subclasses provide their image-specific build (and optional agent exec) via
+    `_build_runner_container`, and may append output via `_print_extras`.
+    """
 
-def print_hotdata_query_commands(
-    workspace_id: str,
-    workspace_name: str,
-    sandbox_id: str,
-    sandbox_name: str,
-    pipeline_name: str,
-    tables: list[str],
-    transcript_path: Path,
-) -> None:
-    sys.stdout.write("\n=== Hotdata sandbox ===\n")
-    sys.stdout.write(f"workspace: {workspace_name} ({workspace_id})\n")
-    sys.stdout.write(f"sandbox:   {sandbox_name} ({sandbox_id})\n")
-    sys.stdout.write(f"pipeline:  {pipeline_name}\n")
-    sys.stdout.write("\n=== Query the loaded data (run each query separately) ===\n")
-    sys.stdout.write(
-        f"HOTDATA_SANDBOX={sandbox_id} hotdata datasets list -w {workspace_id}\n"
-    )
-    for table in tables:
-        sys.stdout.write("# ---\n")
-        sys.stdout.write(
-            f'HOTDATA_SANDBOX={sandbox_id} hotdata query -w {workspace_id} '
-            f'"SELECT * FROM datasets.{sandbox_id}.{table} LIMIT 10"\n'
+    RUN_ID_BYTES = 10
+    AGENT_OWNER: str | None = None
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        host_override: str | None,
+        name_override: str | None,
+    ) -> None:
+        self.api_key = api_key
+        self.host_override = host_override
+        self.run_id = (
+            f"{int(time.time() * 1000):012x}{secrets.token_hex(self.RUN_ID_BYTES)}"
         )
-    sys.stdout.write("\n=== Replay the chat as markdown ===\n")
-    sys.stdout.write(
-        f"{TRANSCRIPT_TO_MARKDOWN_SCRIPT} {transcript_path} | glow -\n"
-    )
-    sys.stdout.flush()
+        self.sandbox_name = self._derive_sandbox_name(name_override)
 
+    def _derive_sandbox_name(self, override: str | None) -> str:
+        return slugify(override) if override else f"agent_{self.run_id}"
 
-async def run_datagen(
-    *,
-    api_key: str,
-    host_override: str | None,
-    name_override: str | None,
-) -> None:
-    run_id = f"{int(time.time() * 1000):012x}{secrets.token_hex(10)}"
-    sandbox_name = slugify(name_override) if name_override else f"agent_{run_id}"
-    print(f"→ run {run_id}", file=sys.stderr)
+    async def run(self) -> None:
+        self._log_startup()
 
-    with HotdataSession(api_key, host_override) as session:
-        sandbox_id = session.create_sandbox(sandbox_name)
-        print(
-            f"→ workspace={session.workspace_id} sandbox={sandbox_id}",
-            file=sys.stderr,
-        )
-
-        async with dagger.connection(dagger.Config(log_output=sys.stderr)):
-            api_key_secret = dag.set_secret("hotdata-api-key", api_key)
-            container = build_datagen_container(host_file("source.py"))
-            container = add_hotdata_env(
-                container,
-                api_key_secret=api_key_secret,
-                host=session.host,
-                workspace_id=session.workspace_id,
-                sandbox_id=sandbox_id,
-                run_id=run_id,
+        with HotdataSession(self.api_key, self.host_override) as session:
+            sandbox_id = session.create_sandbox(self.sandbox_name)
+            print(
+                f"→ workspace={session.workspace_id} sandbox={sandbox_id}",
+                file=sys.stderr,
             )
-            container = mount_runner(container, host_file("container/runner.py"))
-            stdout = await container.stdout()
 
-        summary = parse_runner_summary(stdout)
-        print(
-            f"→ runner uploaded {len(summary['tables'])} tables "
-            f"from pipeline '{summary['pipeline_name']}'",
-            file=sys.stderr,
-        )
-        previews = session.preview(summary["tables"])
+            async with dagger.connection(dagger.Config(log_output=sys.stderr)):
+                runner_container = await self._build_runner_container(session)
+                runner_stdout = await runner_container.stdout()
 
-    print("\n=== preview ===", flush=True)
-    for table, rows in previews.items():
-        print(f"[{table}]\n{_format_preview(rows)}\n", flush=True)
+            summary = Runner.parse_summary(runner_stdout)
+            print(
+                f"→ runner uploaded {len(summary['tables'])} tables "
+                f"from pipeline '{summary['pipeline_name']}'",
+                file=sys.stderr,
+            )
+            previews = session.preview(summary["tables"], max_columns=PREVIEW_COLS)
+            workspace_id = session.workspace_id
+            workspace_name = session.workspace_name
 
-
-async def run_claude(
-    *,
-    api_key: str,
-    host_override: str | None,
-    name_override: str | None,
-    prompt_path: Path,
-    model: str,
-    effort: str,
-    output_format: str,
-) -> None:
-    anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-    if not anthropic_key:
-        raise RuntimeError(
-            "ANTHROPIC_API_KEY must be set (export ANTHROPIC_API_KEY=...) when --with-prompt is used."
-        )
-    github_token = os.environ.get("GITHUB_TOKEN", "").strip()
-
-    run_id = f"{int(time.time() * 1000):012x}{secrets.token_hex(6)}"
-    name_slug = slugify(name_override) if name_override else slugify(prompt_path.stem)
-    sandbox_name = f"{name_slug}_{run_id[-8:]}"
-
-    print(f"→ prompt: {prompt_path}", file=sys.stderr)
-    print(f"→ model:  {model} (effort={effort})", file=sys.stderr)
-    print(f"→ creating hotdata sandbox {sandbox_name}", file=sys.stderr)
-    if github_token:
-        print("→ GITHUB_TOKEN found on host — passing through as secret", file=sys.stderr)
-    else:
-        print(
-            "→ GITHUB_TOKEN not set — GitHub API calls will be unauthenticated (60 req/hr)",
-            file=sys.stderr,
+        self._print_output(
+            workspace_id=workspace_id,
+            workspace_name=workspace_name,
+            sandbox_id=sandbox_id,
+            summary=summary,
+            previews=previews,
         )
 
-    with HotdataSession(api_key, host_override) as session:
-        sandbox_id = session.create_sandbox(sandbox_name)
-        workspace_id = session.workspace_id
-        workspace_name = session.workspace_name
-        host = session.host
-        print(f"→ workspace={workspace_id} sandbox={sandbox_id}", file=sys.stderr)
+    def _log_startup(self) -> None:
+        print(f"→ run {self.run_id}", file=sys.stderr)
 
-    async with dagger.connection(dagger.Config(log_output=sys.stderr)):
-        anthropic_secret = dag.set_secret("anthropic-api-key", anthropic_key)
-        hotdata_secret = dag.set_secret("hotdata-api-key", api_key)
+    async def _build_runner_container(self, session: HotdataSession):
+        hotdata_secret = dag.set_secret("hotdata-api-key", self.api_key)
+        agent_container = await self._build_agent_container(session, hotdata_secret)
+        return Runner.mount_and_exec(
+            agent_container,
+            host_file("container/runner.py"),
+            owner=self.AGENT_OWNER,
+        )
+
+    async def _build_agent_container(
+        self, session: HotdataSession, hotdata_secret: dagger.Secret
+    ):
+        """Return the env-injected container the runner will be mounted on. Subclass-specific image build (and optional agent exec) happens here."""
+        raise NotImplementedError
+
+    def _print_output(
+        self,
+        *,
+        workspace_id: str,
+        workspace_name: str,
+        sandbox_id: str,
+        summary: dict,
+        previews: dict[str, list[list[object]]],
+    ) -> None:
+        sys.stdout.write("\n=== Hotdata sandbox ===\n")
+        sys.stdout.write(f"workspace: {workspace_name} ({workspace_id})\n")
+        sys.stdout.write(f"sandbox:   {self.sandbox_name} ({sandbox_id})\n")
+        sys.stdout.write(f"pipeline:  {summary['pipeline_name']}\n")
+
+        sys.stdout.write("\n=== Query the loaded data (run each query separately) ===\n")
+        for table in summary["tables"]:
+            cols = ", ".join(str(c) for c in previews[table][0][:PREVIEW_COLS])
+            sys.stdout.write("# ---\n")
+            sys.stdout.write(
+                f'HOTDATA_SANDBOX={sandbox_id} hotdata query -w {workspace_id} '
+                f'"SELECT {cols} FROM datasets.{sandbox_id}.{table} LIMIT 10"\n'
+            )
+
+        sys.stdout.write("\n=== Preview ===\n")
+        for table, rows in previews.items():
+            sys.stdout.write(f"[{table}]\n{self._format_preview(rows)}\n\n")
+
+        self._print_extras()
+        sys.stdout.flush()
+
+    def _print_extras(self) -> None:
+        return None
+
+    @staticmethod
+    def _format_preview(columns_plus_rows: list[list[object]]) -> str:
+        return "\n".join(
+            "\t".join("" if v is None else str(v) for v in r) for r in columns_plus_rows
+        )
+
+
+class DatagenFlow(BaseFlow):
+    """Default flow: build a minimal container and run the trusted runner against a fresh sandbox. No agent in the loop."""
+
+    async def _build_agent_container(
+        self, session: HotdataSession, hotdata_secret: dagger.Secret
+    ):
+        container = DatagenImage.build(host_file("source.py"))
+        return session.inject_env(
+            container, api_key_secret=hotdata_secret, run_id=self.run_id
+        )
+
+
+class ClaudeFlow(BaseFlow):
+    """Claude flow: layer Claude+Node on the base image, exec Claude over `source.py`, then mount the trusted runner on the post-Claude layer so the agent never sees it."""
+
+    RUN_ID_BYTES = 6
+    AGENT_OWNER = ClaudeImage.AGENT_OWNER
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        host_override: str | None,
+        name_override: str | None,
+        prompt_path: Path,
+        model: str,
+        effort: str,
+        output_format: str,
+    ) -> None:
+        anthropic_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+        if not anthropic_key:
+            raise RuntimeError(
+                "ANTHROPIC_API_KEY must be set (export ANTHROPIC_API_KEY=...) when --with-prompt is used."
+            )
+        self.anthropic_key = anthropic_key
+        self.github_token = os.environ.get("GITHUB_TOKEN", "").strip()
+        self.prompt_path = prompt_path
+        self.model = model
+        self.effort = effort
+        self.output_format = output_format
+        super().__init__(
+            api_key=api_key, host_override=host_override, name_override=name_override
+        )
+        self.transcript_path = (
+            DATA_DIR / f"{self.run_id}.{TRANSCRIPT_EXT[output_format]}"
+        )
+
+    def _derive_sandbox_name(self, override: str | None) -> str:
+        slug = slugify(override) if override else slugify(self.prompt_path.stem)
+        return f"{slug}_{self.run_id[-8:]}"
+
+    def _log_startup(self) -> None:
+        super()._log_startup()
+        print(f"→ prompt: {self.prompt_path}", file=sys.stderr)
+        print(f"→ model:  {self.model} (effort={self.effort})", file=sys.stderr)
+        if self.github_token:
+            print(
+                "→ GITHUB_TOKEN found on host — passing through as secret",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "→ GITHUB_TOKEN not set — GitHub API calls will be unauthenticated (60 req/hr)",
+                file=sys.stderr,
+            )
+
+    async def _build_agent_container(
+        self, session: HotdataSession, hotdata_secret: dagger.Secret
+    ):
+        anthropic_secret = dag.set_secret("anthropic-api-key", self.anthropic_key)
         github_secret = (
-            dag.set_secret("github-token", github_token) if github_token else None
+            dag.set_secret("github-token", self.github_token)
+            if self.github_token
+            else None
         )
 
-        base, claude_cmd = build_claude_container(
-            prompt_file=dag.host().file(str(prompt_path)),
+        base, claude_cmd = ClaudeImage.build(
+            prompt_file=dag.host().file(str(self.prompt_path)),
             source_file=host_file("source.py"),
             anthropic_secret=anthropic_secret,
             github_secret=github_secret,
-            model=model,
-            effort=effort,
-            output_format=output_format,
+            model=self.model,
+            effort=self.effort,
+            output_format=self.output_format,
         )
-        base = add_hotdata_env(
-            base,
-            api_key_secret=hotdata_secret,
-            host=host,
-            workspace_id=workspace_id,
-            sandbox_id=sandbox_id,
-            run_id=run_id,
+        base = session.inject_env(
+            base, api_key_secret=hotdata_secret, run_id=self.run_id
         )
 
-        # Claude runs first; runner.py is mounted only on the post-Claude layer
-        # so the agent can't read it during its exec.
-        after_claude = base.with_exec(["sh", "-c", claude_cmd])
-        after_runner = mount_runner(
-            after_claude, host_file("container/runner.py"), owner=AGENT_OWNER
+        # Claude runs first; the runner is mounted only on the post-Claude layer
+        # (in BaseFlow) so the agent can't read it during its exec. Persist the
+        # transcript before the runner runs so it survives a runner failure.
+        # `redirect_stdout` keeps the stream-json out of Dagger's progress log —
+        # the transcript materializes as a single file when the exec finishes.
+        after_claude = base.with_exec(
+            ["sh", "-c", claude_cmd], redirect_stdout="/tmp/claude.jsonl"
         )
+        claude_stdout = await after_claude.file("/tmp/claude.jsonl").contents()
+        self._write_transcript(claude_stdout)
+        return after_claude
 
-        claude_stdout = await after_claude.stdout()
-
-        # Persist the transcript before the runner runs — if the runner fails
-        # we still want the transcript on disk for debugging.
+    def _write_transcript(self, claude_stdout: str) -> None:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-        transcript_path = DATA_DIR / f"{run_id}.{TRANSCRIPT_EXT[output_format]}"
-        transcript_path.write_text(
-            claude_stdout if claude_stdout.endswith("\n") else claude_stdout + "\n"
+        text = claude_stdout if claude_stdout.endswith("\n") else claude_stdout + "\n"
+        self.transcript_path.write_text(text)
+        print(f"→ wrote claude transcript to {self.transcript_path}", file=sys.stderr)
+
+    def _print_extras(self) -> None:
+        sys.stdout.write("\n=== Replay the chat as markdown ===\n")
+        sys.stdout.write(
+            f"{TRANSCRIPT_TO_MARKDOWN_SCRIPT} {self.transcript_path} | glow -\n"
         )
-        print(f"→ wrote claude transcript to {transcript_path}", file=sys.stderr)
-
-        runner_stdout = await after_runner.stdout()
-
-    summary = parse_runner_summary(runner_stdout)
-    print(
-        f"→ runner uploaded {len(summary['tables'])} tables "
-        f"from pipeline '{summary['pipeline_name']}'",
-        file=sys.stderr,
-    )
-
-    print_hotdata_query_commands(
-        workspace_id=workspace_id,
-        workspace_name=workspace_name,
-        sandbox_id=sandbox_id,
-        sandbox_name=sandbox_name,
-        pipeline_name=summary["pipeline_name"],
-        tables=summary["tables"],
-        transcript_path=transcript_path,
-    )
 
 
 async def main(argv: Sequence[str]) -> int:
@@ -292,7 +343,7 @@ async def main(argv: Sequence[str]) -> int:
         if not prompt_path.is_file():
             print(f"Prompt file not found: {prompt_path}", file=sys.stderr)
             return 2
-        await run_claude(
+        await ClaudeFlow(
             api_key=api_key,
             host_override=host_override,
             name_override=args.name,
@@ -300,13 +351,13 @@ async def main(argv: Sequence[str]) -> int:
             model=args.model,
             effort=args.effort,
             output_format=args.output_format,
-        )
+        ).run()
     else:
-        await run_datagen(
+        await DatagenFlow(
             api_key=api_key,
             host_override=host_override,
             name_override=args.name,
-        )
+        ).run()
     return 0
 
 

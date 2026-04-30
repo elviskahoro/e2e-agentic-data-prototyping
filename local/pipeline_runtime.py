@@ -7,7 +7,10 @@ The two flows differ in whether Claude/Node tooling is layered on top, but they 
 - mount the same `container/runner.py` that imports `source.py`, runs a dlt pipeline against an in-memory DuckDB, and uploads each user-facing arrow→parquet table to the sandbox,
 - parse the runner's last-stdout-line JSON summary.
 
-This module owns those shared pieces plus the two image builders so the entry script reads as orchestration, not plumbing.
+Helpers are grouped by the semantic entity they belong to: `Source` (the user-facing
+dlt script), `Runner` (the trusted in-container script), `HotdataSession` (the
+workspace+sandbox-scoped API client), and `DatagenImage` / `ClaudeImage` (the two
+container image builders). The entry script reads as orchestration, not plumbing.
 """
 
 # mypy: disable-error-code="no-untyped-def,arg-type"
@@ -15,6 +18,7 @@ This module owns those shared pieces plus the two image builders so the entry sc
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 import dagger
@@ -28,22 +32,68 @@ from hotdata.models.query_request import QueryRequest
 # move together.
 HOTDATA_PKG = "hotdata>=0.1.0,<0.2"
 
-# Both flows share the same in-container layout: `source.py` lives in `WORKDIR`
-# (where Claude works in the agent flow), and the trusted runner lands at
-# `RUNNER_PATH` outside that workdir so an agent run can't see/edit it.
+# Shared in-container layout: `source.py` lives in `WORKDIR` (where Claude works in
+# the agent flow); the trusted runner lands at `Runner.PATH` outside that workdir
+# so an agent run can't see/edit it.
 WORKDIR = "/workspace"
-SOURCE_PATH = f"{WORKDIR}/source.py"
-RUNNER_PATH = "/app/runner.py"
 
-# Claude-flow specifics. The Claude Code CLI refuses bypassPermissions under
-# root, so the Claude container runs as an unprivileged `agent` user with its
-# own venv. The datagen flow doesn't need any of this.
-PROMPT_PATH = f"{WORKDIR}/prompt.md"
-VENV_PATH = f"{WORKDIR}/.venv"
-AGENT_USER = "agent"
-AGENT_UID = "1000"
-AGENT_HOME = f"/home/{AGENT_USER}"
-AGENT_OWNER = f"{AGENT_USER}:{AGENT_USER}"
+
+class Source:
+    """The user-facing dlt source script. Lives at `Source.PATH` inside `WORKDIR`, writable so the Claude flow can edit it in place."""
+
+    PATH = f"{WORKDIR}/source.py"
+
+    @staticmethod
+    def copy_into(
+        container: dagger.Container,
+        source_file: dagger.File,
+        *,
+        owner: str | None = None,
+    ) -> dagger.Container:
+        """Copy `source.py` into the container at `Source.PATH` (writable).
+
+        `with_file` is used instead of `with_mounted_file` so the Claude flow can
+        edit the file in place during its exec.
+        """
+        kwargs: dict[str, Any] = {}
+        if owner is not None:
+            kwargs["owner"] = owner
+        return container.with_file(Source.PATH, source_file, **kwargs)
+
+
+class Runner:
+    """The trusted in-container runner: imports `source.py`, runs a dlt pipeline against an in-memory DuckDB, and uploads each user-facing arrow→parquet table to the sandbox."""
+
+    PATH = "/app/runner.py"
+
+    @staticmethod
+    def mount_and_exec(
+        container: dagger.Container,
+        runner_file: dagger.File,
+        *,
+        owner: str | None = None,
+    ) -> dagger.Container:
+        """Mount the trusted runner at `Runner.PATH` and exec it.
+
+        Call this on the *post-agent* container in the Claude flow so the runner
+        isn't visible during Claude's exec.
+        """
+        kwargs: dict[str, Any] = {}
+        if owner is not None:
+            kwargs["owner"] = owner
+        return container.with_mounted_file(
+            Runner.PATH, runner_file, **kwargs
+        ).with_exec(["python", Runner.PATH])
+
+    @staticmethod
+    def parse_summary(stdout: str) -> dict[str, Any]:
+        """Runner's last stdout line is JSON: {pipeline_name, run_id, tables, datasets}."""
+        last = stdout.strip().splitlines()[-1] if stdout.strip() else ""
+        if not last.startswith("{"):
+            raise RuntimeError(
+                f"runner did not emit JSON summary; last stdout line: {last!r}"
+            )
+        return json.loads(last)
 
 
 class HotdataSession:
@@ -102,202 +152,191 @@ class HotdataSession:
         self.api_client.set_default_header("X-Sandbox-Id", self.sandbox_id)
         return self.sandbox_id
 
-    def preview(self, tables: list[str]) -> dict[str, list[list[object]]]:
-        """Preview rows from each uploaded table to confirm the load."""
+    def inject_env(
+        self,
+        container: dagger.Container,
+        *,
+        api_key_secret: dagger.Secret,
+        run_id: str,
+    ) -> dagger.Container:
+        """Thread the env vars + secret the in-container runner reads.
+
+        Reads `host`, `workspace_id`, and `sandbox_id` off `self`; safe to call
+        after `__exit__` since these attributes persist.
+        """
+        return (
+            container.with_env_variable("HOTDATA_API_URL", self.host)
+            .with_env_variable("HOTDATA_WORKSPACE_ID", self.workspace_id)
+            .with_env_variable("HOTDATA_SANDBOX_ID", self.sandbox_id)
+            .with_env_variable("DLT_RUN_ID", run_id)
+            .with_secret_variable("HOTDATA_API_KEY", api_key_secret)
+        )
+
+    def preview(
+        self, tables: list[str], *, max_columns: int | None = None, limit: int = 10
+    ) -> dict[str, list[list[object]]]:
+        """Preview rows from each uploaded table to confirm the load.
+
+        When `max_columns` is set, a `SELECT * LIMIT 0` schema peek picks the first
+        N columns and the preview pulls only those — keeps wide tables on-screen.
+        Index 0 of each row list is the column header.
+        """
         query_api = hotdata.QueryApi(self.api_client)
         results: dict[str, list[list[object]]] = {}
         for table in sorted(set(tables)):
-            sql = f"SELECT * FROM datasets.{self.sandbox_id}.{table} LIMIT 10"
+            qualified = f"datasets.{self.sandbox_id}.{table}"
+            if max_columns is not None:
+                schema_resp = query_api.query(
+                    QueryRequest(sql=f"SELECT * FROM {qualified} LIMIT 0")
+                )
+                cols = list(schema_resp.columns)[:max_columns]
+                projection = ", ".join(f'"{c.replace(chr(34), chr(34) * 2)}"' for c in cols)
+            else:
+                projection = "*"
+            sql = f"SELECT {projection} FROM {qualified} LIMIT {limit}"
             resp = query_api.query(QueryRequest(sql=sql))
             results[table] = [[*resp.columns]] + [list(r) for r in (resp.rows or [])]
         return results
 
 
-def with_source(
-    container: dagger.Container,
-    source_file: dagger.File,
-    *,
-    owner: str | None = None,
-) -> dagger.Container:
-    """Copy `source.py` into the container at `SOURCE_PATH` (writable).
-
-    `with_file` is used instead of `with_mounted_file` so the Claude flow can
-    edit the file in place during its exec.
-    """
-    kwargs: dict[str, Any] = {}
-    if owner is not None:
-        kwargs["owner"] = owner
-    return container.with_file(SOURCE_PATH, source_file, **kwargs)
-
-
-def add_hotdata_env(
-    container: dagger.Container,
-    *,
-    api_key_secret: dagger.Secret,
-    host: str,
-    workspace_id: str,
-    sandbox_id: str,
-    run_id: str,
-) -> dagger.Container:
-    """Thread the env vars + secret the in-container runner reads."""
-    return (
-        container.with_env_variable("HOTDATA_API_URL", host)
-        .with_env_variable("HOTDATA_WORKSPACE_ID", workspace_id)
-        .with_env_variable("HOTDATA_SANDBOX_ID", sandbox_id)
-        .with_env_variable("DLT_RUN_ID", run_id)
-        .with_secret_variable("HOTDATA_API_KEY", api_key_secret)
-    )
-
-
-def mount_runner(
-    container: dagger.Container,
-    runner_file: dagger.File,
-    *,
-    owner: str | None = None,
-) -> dagger.Container:
-    """Mount the trusted runner at `RUNNER_PATH` and exec it.
-
-    Call this on the *post-agent* container in the Claude flow so the runner
-    isn't visible during Claude's exec.
-    """
-    kwargs: dict[str, Any] = {}
-    if owner is not None:
-        kwargs["owner"] = owner
-    return container.with_mounted_file(
-        RUNNER_PATH, runner_file, **kwargs
-    ).with_exec(["python", RUNNER_PATH])
-
-
-def parse_runner_summary(stdout: str) -> dict[str, Any]:
-    """Runner's last stdout line is JSON: {pipeline_name, run_id, tables, datasets}."""
-    last = stdout.strip().splitlines()[-1] if stdout.strip() else ""
-    if not last.startswith("{"):
-        raise RuntimeError(
-            f"runner did not emit JSON summary; last stdout line: {last!r}"
-        )
-    return json.loads(last)
-
-
 def host_file(relpath: str) -> dagger.File:
     """Resolve a path relative to this module's directory as a `dagger.File`."""
-    from pathlib import Path
-
     here = Path(__file__).resolve().parent
     return dag.host().file(str(here / relpath))
 
 
-def build_datagen_container(source_file: dagger.File) -> dagger.Container:
-    """Minimal image: dlt[duckdb] + duckdb + pyarrow + hotdata, with `source.py` copied into `WORKDIR`. The runner runs as root since there's no agent involved."""
-    return (
-        dag.container()
-        .from_("ghcr.io/astral-sh/uv:python3.13-bookworm-slim")
-        .with_mounted_cache("/root/.cache/uv", dag.cache_volume("dlt-datagen-uv"))
-        .with_env_variable("UV_LINK_MODE", "copy")
-        .with_exec(
-            [
-                "uv",
-                "pip",
-                "install",
-                "--system",
-                "dlt[duckdb]",
-                "duckdb",
-                "pyarrow",
-                HOTDATA_PKG,
-            ]
+class DatagenImage:
+    """Minimal image for the datagen flow: dlt[duckdb] + duckdb + pyarrow + hotdata, with `source.py` copied into `WORKDIR`. The runner runs as root since there's no agent involved."""
+
+    @staticmethod
+    def build(source_file: dagger.File) -> dagger.Container:
+        return (
+            dag.container()
+            .from_("ghcr.io/astral-sh/uv:python3.13-bookworm-slim")
+            .with_mounted_cache("/root/.cache/uv", dag.cache_volume("dlt-datagen-uv"))
+            .with_env_variable("UV_LINK_MODE", "copy")
+            .with_exec(
+                [
+                    "uv",
+                    "pip",
+                    "install",
+                    "--system",
+                    "dlt[duckdb]",
+                    "duckdb",
+                    "pyarrow",
+                    HOTDATA_PKG,
+                ]
+            )
+            .with_workdir(WORKDIR)
+            .with_(lambda c: Source.copy_into(c, source_file))
         )
-        .with_workdir(WORKDIR)
-        .with_(lambda c: with_source(c, source_file))
-    )
 
 
-def build_claude_container(
-    *,
-    prompt_file: dagger.File,
-    source_file: dagger.File,
-    anthropic_secret: dagger.Secret,
-    github_secret: dagger.Secret | None,
-    model: str,
-    effort: str,
-    output_format: str,
-) -> tuple[dagger.Container, str]:
-    """Image with Claude Code + Node + dlt[workspace] + dlt-ai toolkits, plus a writable `source.py` and the user's prompt mounted at `PROMPT_PATH`.
+class ClaudeImage:
+    """Image for the Claude flow: Claude Code + Node + dlt[workspace] + dlt-ai toolkits, plus a writable `source.py` and the user's prompt mounted at `ClaudeImage.PROMPT_PATH`.
 
-    Returns `(container, claude_cmd)` — the caller threads hotdata env via `add_hotdata_env`, execs `claude_cmd`, then mounts the runner on the post-Claude layer with `mount_runner(..., owner=AGENT_OWNER)`.
+    The Claude Code CLI refuses bypassPermissions under root, so this image runs
+    as an unprivileged `agent` user with its own venv. The datagen flow doesn't
+    need any of this.
     """
-    venv_path_env = (
-        f"{VENV_PATH}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-    )
-    claude_cmd = (
-        f'exec claude -p "$(cat {PROMPT_PATH})" '
-        f"--model {model} "
-        f"--effort {effort} "
-        f"--output-format {output_format} "
-        "--permission-mode bypassPermissions "
-        + ("--verbose" if output_format == "stream-json" else "")
-    ).strip()
 
-    base = (
-        dag.container()
-        .from_("ghcr.io/astral-sh/uv:python3.13-bookworm-slim")
-        .with_mounted_cache("/root/.npm", dag.cache_volume("dlt-claude-npm"))
-        .with_env_variable("UV_LINK_MODE", "copy")
-        .with_exec(
-            [
-                "sh",
-                "-c",
-                "apt-get update && apt-get install -y --no-install-recommends "
-                "git curl ca-certificates gnupg && rm -rf /var/lib/apt/lists/*",
-            ]
+    PROMPT_PATH = f"{WORKDIR}/prompt.md"
+    VENV_PATH = f"{WORKDIR}/.venv"
+    AGENT_USER = "agent"
+    AGENT_UID = "1000"
+    AGENT_HOME = f"/home/{AGENT_USER}"
+    AGENT_OWNER = f"{AGENT_USER}:{AGENT_USER}"
+
+    @staticmethod
+    def build(
+        *,
+        prompt_file: dagger.File,
+        source_file: dagger.File,
+        anthropic_secret: dagger.Secret,
+        github_secret: dagger.Secret | None,
+        model: str,
+        effort: str,
+        output_format: str,
+    ) -> tuple[dagger.Container, str]:
+        """Returns `(container, claude_cmd)` — the caller threads hotdata env via `HotdataSession.inject_env`, execs `claude_cmd`, then mounts the runner on the post-Claude layer with `Runner.mount_and_exec(..., owner=ClaudeImage.AGENT_OWNER)`."""
+        venv_path_env = (
+            f"{ClaudeImage.VENV_PATH}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         )
-        .with_exec(
-            [
-                "sh",
-                "-c",
-                "curl -fsSL https://deb.nodesource.com/setup_20.x | bash - "
-                "&& apt-get install -y --no-install-recommends nodejs "
-                "&& rm -rf /var/lib/apt/lists/*",
-            ]
+        claude_cmd = (
+            f'exec claude -p "$(cat {ClaudeImage.PROMPT_PATH})" '
+            f"--model {model} "
+            f"--effort {effort} "
+            f"--output-format {output_format} "
+            "--permission-mode bypassPermissions "
+            + ("--verbose" if output_format == "stream-json" else "")
+        ).strip()
+
+        base = (
+            dag.container()
+            .from_("ghcr.io/astral-sh/uv:python3.13-bookworm-slim")
+            .with_mounted_cache("/root/.npm", dag.cache_volume("dlt-claude-npm"))
+            .with_env_variable("UV_LINK_MODE", "copy")
+            .with_exec(
+                [
+                    "sh",
+                    "-c",
+                    "apt-get update && apt-get install -y --no-install-recommends "
+                    "git curl ca-certificates gnupg && rm -rf /var/lib/apt/lists/*",
+                ]
+            )
+            .with_exec(
+                [
+                    "sh",
+                    "-c",
+                    "curl -fsSL https://deb.nodesource.com/setup_20.x | bash - "
+                    "&& apt-get install -y --no-install-recommends nodejs "
+                    "&& rm -rf /var/lib/apt/lists/*",
+                ]
+            )
+            .with_exec(["npm", "install", "-g", "@anthropic-ai/claude-code"])
+            .with_exec(
+                [
+                    "sh",
+                    "-c",
+                    f"useradd -m -u {ClaudeImage.AGENT_UID} {ClaudeImage.AGENT_USER} "
+                    f"&& mkdir -p {WORKDIR} /app "
+                    f"&& chown -R {ClaudeImage.AGENT_OWNER} {WORKDIR} /app {ClaudeImage.AGENT_HOME}",
+                ]
+            )
+            .with_user(ClaudeImage.AGENT_USER)
+            .with_env_variable("HOME", ClaudeImage.AGENT_HOME)
+            .with_workdir(WORKDIR)
+            .with_mounted_cache(
+                f"{ClaudeImage.AGENT_HOME}/.cache/uv",
+                dag.cache_volume("dlt-claude-uv-agent"),
+                owner=ClaudeImage.AGENT_OWNER,
+            )
+            .with_exec(["uv", "venv", ClaudeImage.VENV_PATH])
+            .with_env_variable("VIRTUAL_ENV", ClaudeImage.VENV_PATH)
+            .with_env_variable("PATH", venv_path_env)
+            .with_exec(
+                [
+                    "uv",
+                    "pip",
+                    "install",
+                    "dlt[workspace]",
+                    "duckdb",
+                    "pyarrow",
+                    HOTDATA_PKG,
+                ]
+            )
+            .with_exec(["dlt", "ai", "init", "--agent=claude"])
+            .with_exec(["dlt", "ai", "toolkit", "list"])
+            .with_exec(["dlt", "ai", "toolkit", "rest-api-pipeline", "install"])
+            .with_exec(["dlt", "ai", "toolkit", "data-exploration", "install"])
+            .with_mounted_file(
+                ClaudeImage.PROMPT_PATH, prompt_file, owner=ClaudeImage.AGENT_OWNER
+            )
+            .with_(
+                lambda c: Source.copy_into(c, source_file, owner=ClaudeImage.AGENT_OWNER)
+            )
+            .with_secret_variable("ANTHROPIC_API_KEY", anthropic_secret)
         )
-        .with_exec(["npm", "install", "-g", "@anthropic-ai/claude-code"])
-        .with_exec(
-            [
-                "sh",
-                "-c",
-                f"useradd -m -u {AGENT_UID} {AGENT_USER} "
-                f"&& mkdir -p {WORKDIR} /app "
-                f"&& chown -R {AGENT_OWNER} {WORKDIR} /app {AGENT_HOME}",
-            ]
-        )
-        .with_user(AGENT_USER)
-        .with_env_variable("HOME", AGENT_HOME)
-        .with_workdir(WORKDIR)
-        .with_mounted_cache(
-            f"{AGENT_HOME}/.cache/uv",
-            dag.cache_volume("dlt-claude-uv-agent"),
-            owner=AGENT_OWNER,
-        )
-        .with_exec(["uv", "venv", VENV_PATH])
-        .with_env_variable("VIRTUAL_ENV", VENV_PATH)
-        .with_env_variable("PATH", venv_path_env)
-        .with_exec(
-            [
-                "uv",
-                "pip",
-                "install",
-                "dlt[workspace]",
-                "duckdb",
-                "pyarrow",
-                HOTDATA_PKG,
-            ]
-        )
-        .with_exec(["dlt", "ai", "init", "--agent=claude"])
-        .with_exec(["dlt", "ai", "toolkit", "list"])
-        .with_exec(["dlt", "ai", "toolkit", "rest-api-pipeline", "install"])
-        .with_exec(["dlt", "ai", "toolkit", "data-exploration", "install"])
-        .with_mounted_file(PROMPT_PATH, prompt_file, owner=AGENT_OWNER)
-        .with_(lambda c: with_source(c, source_file, owner=AGENT_OWNER))
-        .with_secret_variable("ANTHROPIC_API_KEY", anthropic_secret)
-    )
-    if github_secret is not None:
-        base = base.with_secret_variable("GITHUB_TOKEN", github_secret)
-    return base, claude_cmd
+        if github_secret is not None:
+            base = base.with_secret_variable("GITHUB_TOKEN", github_secret)
+        return base, claude_cmd

@@ -34,6 +34,6 @@ CLI commands for the resulting sandbox.
 ## Layout
 
 - `sandbox.py` — single entry, dispatches on `--with-prompt`.
-- `pipeline_runtime.py` — host-side helpers: `HotdataSession`, env-threading, container builders, runner mount.
+- `pipeline_runtime.py` — host-side helpers grouped by entity: `Source`, `Runner`, `HotdataSession` (env-threading + sandbox ops), `DatagenImage`, `ClaudeImage`.
 - `source.py` — canonical dlt source. Contract: `PIPELINE_NAME: str` + `source()` callable. Claude may rewrite this file.
 - `container/runner.py` — trusted in-container runner: imports `/workspace/source.py`, runs the dlt pipeline against an in-memory DuckDB, uploads each user-facing table to the sandbox.
