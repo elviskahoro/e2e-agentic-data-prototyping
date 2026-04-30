@@ -452,7 +452,7 @@ requires-dist = [
     { name = "dagger-io", specifier = ">=0.20.6" },
     { name = "dlt", extras = ["filesystem", "parquet"], specifier = ">=1.25.0" },
     { name = "duckdb", specifier = ">=1.5.2" },
-    { name = "hotdata", git = "https://github.com/hotdata-dev/sdk-python" },
+    { name = "hotdata", git = "https://github.com/hotdata-dev/sdk-python?rev=d3806b6a5d49b3b069a7d196859a49e7ccbe66ff" },
     { name = "opentelemetry-exporter-otlp-proto-grpc", specifier = ">=1.41.1" },
     { name = "pandas", specifier = ">=3.0.2" },
     { name = "pyarrow", specifier = ">=24.0.0" },
@@ -757,7 +757,7 @@ wheels = [
 [[package]]
 name = "hotdata"
 version = "1.0.0"
-source = { git = "https://github.com/hotdata-dev/sdk-python#d3806b6a5d49b3b069a7d196859a49e7ccbe66ff" }
+source = { git = "https://github.com/hotdata-dev/sdk-python?rev=d3806b6a5d49b3b069a7d196859a49e7ccbe66ff#d3806b6a5d49b3b069a7d196859a49e7ccbe66ff" }
 dependencies = [
     { name = "pydantic" },
     { name = "python-dateutil" },

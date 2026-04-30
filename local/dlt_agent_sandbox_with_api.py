@@ -19,7 +19,7 @@ from hotdata.models.query_request import QueryRequest
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATAGEN_SOURCE = PROJECT_ROOT / "source.py"
-HOTDATA_SDK_GIT = "git+https://github.com/hotdata-dev/sdk-python"
+HOTDATA_SDK_GIT = "git+https://github.com/hotdata-dev/sdk-python@d3806b6a5d49b3b069a7d196859a49e7ccbe66ff"
 CONTAINER_ENTRY = PROJECT_ROOT / "dlt_agent_container_entry.py"
 
 
