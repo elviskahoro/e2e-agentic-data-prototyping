@@ -452,7 +452,7 @@ requires-dist = [
     { name = "dagger-io", specifier = ">=0.20.6" },
     { name = "dlt", extras = ["filesystem", "parquet"], specifier = ">=1.25.0" },
     { name = "duckdb", specifier = ">=1.5.2" },
-    { name = "hotdata", git = "https://github.com/hotdata-dev/sdk-python?rev=d3806b6a5d49b3b069a7d196859a49e7ccbe66ff" },
+    { name = "hotdata", specifier = ">=0.1.0,<0.2" },
     { name = "opentelemetry-exporter-otlp-proto-grpc", specifier = ">=1.41.1" },
     { name = "pandas", specifier = ">=3.0.2" },
     { name = "pyarrow", specifier = ">=24.0.0" },
@@ -756,13 +756,17 @@ wheels = [
 
 [[package]]
 name = "hotdata"
-version = "1.0.0"
-source = { git = "https://github.com/hotdata-dev/sdk-python?rev=d3806b6a5d49b3b069a7d196859a49e7ccbe66ff#d3806b6a5d49b3b069a7d196859a49e7ccbe66ff" }
+version = "0.1.0"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pydantic" },
     { name = "python-dateutil" },
     { name = "typing-extensions" },
     { name = "urllib3" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/63/a2/7e997581dc23fca35330c355cd433135c4d18cc5506fb77fb35fd0180e97/hotdata-0.1.0.tar.gz", hash = "sha256:6795ff7381fb8f2f258ee3f0c31f9b1ba2f5908728c51fa399840fdf603acc46", size = 97691, upload-time = "2026-04-25T17:57:00.102Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/3f/21/e04ca377e7e3db50215bf207867ef02a56af11f61022390b7689e6ff2db3/hotdata-0.1.0-py3-none-any.whl", hash = "sha256:304f46d7c7ed5b586a9102684ef42e45972955dfb66a492c5e0b016e8bc545fa", size = 242376, upload-time = "2026-04-25T17:56:58.126Z" },
 ]
 
 [[package]]
