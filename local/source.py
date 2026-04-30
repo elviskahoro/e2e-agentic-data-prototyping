@@ -1,13 +1,22 @@
-"""dlt source for synthetic purchases and customers. Agents may modify this file to change the generated data."""
+"""dlt source for synthetic purchases and customers — the swappable payload the runner imports.
+
+Contract with `container/runner.py`:
+- `PIPELINE_NAME: str` — used as both pipeline_name and dataset_name.
+- `source()` — callable returning a dlt source or resource.
+
+Agents may rewrite this file; the runner discovers tables from the dlt schema, so adding/removing resources here doesn't require changes to the runtime.
+"""
 
 import random
 from datetime import datetime, timedelta
 
 import dlt
 
+PIPELINE_NAME = "datagen"
+
 
 @dlt.source
-def datagen_source():
+def source():
     @dlt.resource(primary_key="id")
     def purchases():
         random.seed(42)

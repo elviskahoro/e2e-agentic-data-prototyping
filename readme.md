@@ -22,7 +22,7 @@ The split is the whole point: Dagger and Modal are deliberately interchangeable 
 
 ### `local/` — Dagger driver (local container)
 
-Host driver `dlt_agent_sandbox_with_api.py` opens a Hotdata session, creates a sandbox, then uses Dagger to build a Python 3.13 image, install `dlt[duckdb]` + `pyarrow` + the Hotdata SDK, mount `source.py` and `dlt_agent_container_entry.py` at `/app`, and exec the entry script. The container runs `dlt` against an in-memory DuckDB, converts each table to parquet bytes in-memory (`BytesIO`, never touching disk), and POSTs them to the Hotdata API. The host then queries the sandbox to print a preview.
+Host driver `dlt_agent_sandbox_with_api.py` opens a Hotdata session, creates a sandbox, then uses Dagger to build a Python 3.13 image, install `dlt[duckdb]` + `pyarrow` + the Hotdata SDK, mount `source.py` and `container/entry.py` at `/app`, and exec the entry script. The container runs `dlt` against an in-memory DuckDB, converts each table to parquet bytes in-memory (`BytesIO`, never touching disk), and POSTs them to the Hotdata API. The host then queries the sandbox to print a preview.
 
 Run:
 ```bash
@@ -43,7 +43,7 @@ cd sandbox && uv sync && uv run python dlt_agent_sandbox_with_modal.py
 ## What's shared between the two
 
 - **`source.py`** — identical dlt source defining synthetic `purchases` and `customers` tables. This is the swappable payload an agent would replace.
-- **`dlt_agent_container_entry.py`** — runs inside the container: dlt → **in-memory DuckDB** → arrow → parquet bytes in a `BytesIO` buffer → Hotdata API. **No filesystem writes at any stage** — no DuckDB file, no parquet file, no temp staging. The container is pure compute; bytes only ever live in RAM and on the wire. Prints exactly one JSON line on stdout (table names, plus sandbox id in the Modal version).
+- **In-container entry script** (`local/container/entry.py`, `sandbox/dlt_agent_container_entry.py` — same content, different paths) — runs inside the container: dlt → **in-memory DuckDB** → arrow → parquet bytes in a `BytesIO` buffer → Hotdata API. **No filesystem writes at any stage** — no DuckDB file, no parquet file, no temp staging. The container is pure compute; bytes only ever live in RAM and on the wire. Prints exactly one JSON line on stdout (table names, plus sandbox id in the Modal version).
 - **Hotdata SDK pinned to a GitHub ref** — installed via `git+https://github.com/hotdata-dev/sdk-python` in both runtimes.
 
 ## Prereqs
