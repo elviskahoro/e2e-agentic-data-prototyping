@@ -9,7 +9,7 @@ uv run python sandbox.py
 ```
 
 Builds a minimal Dagger container, copies `source.py` in, and runs the trusted
-`container/runner.py` against a fresh per-run Hotdata sandbox. Previews the
+`runtime/runner.py` against a fresh per-run Hotdata sandbox. Previews the
 uploaded tables on the host.
 
 ## Claude flow
@@ -34,6 +34,7 @@ CLI commands for the resulting sandbox.
 ## Layout
 
 - `sandbox.py` — single entry, dispatches on `--with-prompt`.
-- `pipeline_runtime.py` — host-side helpers grouped by entity: `Source`, `Runner`, `HotdataSession` (env-threading + sandbox ops), `DatagenImage`, `ClaudeImage`.
-- `source.py` — canonical dlt source. Contract: `PIPELINE_NAME: str` + `source()` callable. Claude may rewrite this file.
-- `container/runner.py` — trusted in-container runner: imports `/workspace/source.py`, runs the dlt pipeline against an in-memory DuckDB, uploads each user-facing table to the sandbox.
+- `runtime/` — the pipeline runtime, split into two halves on opposite sides of a trust boundary (see `runtime/__init__.py` for the full why):
+  - `runtime/host.py` — runs on your laptop. Builds Dagger images, opens the Hotdata sandbox, threads env vars + secrets, mounts the runner on the *post-agent* container layer, and parses its JSON summary. Exposes `Source`, `Runner`, `HotdataSession`, `DatagenImage`, `ClaudeImage`.
+  - `runtime/runner.py` — runs INSIDE the Dagger container. Imports `/workspace/source.py`, runs the dlt pipeline against an in-memory DuckDB, uploads each user-facing table to the sandbox. Mounted at `/app/runner.py` only after Claude has already exited, so the agent never sees it.
+- `source.py` — canonical dlt source. Contract: `source()` returns a `@dlt.source(name=...)`-decorated callable. Claude may rewrite this file.

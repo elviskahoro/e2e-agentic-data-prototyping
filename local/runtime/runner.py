@@ -1,7 +1,10 @@
-"""Trusted in-container runner shared by both host scripts (datagen + Claude).
+"""Container half of the pipeline runtime — runs INSIDE Dagger.
 
-Mounted at `/app/runner.py` after the agent step (or directly in datagen runs)
-so it's invisible during Claude's exec.
+See `runtime/__init__.py` for why this is split from `runtime/host.py`
+(short version: trust boundary — the agent gets a writable `source.py`
+but must never see this file). The host mounts this script at `/app/runner.py`
+on the *post-agent* container layer; by the time it exists, Claude has
+already exited.
 
 Contract with /workspace/source.py:
 - Must export `source()` — a `@dlt.source(name=...)`-decorated callable. The
@@ -9,12 +12,12 @@ Contract with /workspace/source.py:
   resource(s) inside should already be configured with any per-page /
   add_limit / pagination knobs.
 
-Demo flow — read main() top-to-bottom:
+Read main() top-to-bottom:
   1. RunnerConfig.from_env()      — what the host handed us
   2. _load_user_source()          — import + validate /workspace/source.py
   3. _run_pipeline()              — dlt → in-memory DuckDB
-  4. _land_tables()                — arrow → parquet → UploadsApi → DatasetsApi
-  5. _emit_result()                — one JSON line to stdout (host parses this)
+  4. _land_tables()               — arrow → parquet → UploadsApi → DatasetsApi
+  5. _emit_result()               — one JSON line to stdout (host parses this)
 
 Everything chatty goes to stderr; only the final JSON goes to stdout.
 """
@@ -126,7 +129,8 @@ def _run_pipeline(src: Any, *, run_id: str) -> tuple[Any, list[str]]:
     print(f"→ dlt load info: {info}", file=sys.stderr)
 
     user_tables = sorted(
-        name for name in pipe.default_schema.tables.keys()
+        name
+        for name in pipe.default_schema.tables.keys()
         if not name.startswith("_dlt_")
     )
     if not user_tables:
@@ -179,9 +183,7 @@ class Uploader:
         pq.write_table(arrow_tbl, buf)
         return buf.getvalue()
 
-    def land(
-        self, arrow_tbl: pa.Table, table_name: str, label: str
-    ) -> dict[str, str]:
+    def land(self, arrow_tbl: pa.Table, table_name: str, label: str) -> dict[str, str]:
         payload = self._arrow_to_parquet_bytes(arrow_tbl)
         print(
             f"→ upload {table_name} rows={arrow_tbl.num_rows} bytes={len(payload)}",

@@ -2,7 +2,7 @@
 
 Default flow — `uv run python sandbox.py`:
     Build a minimal container, copy the canonical `source.py` in, and run the trusted
-    `container/runner.py` against a fresh per-run Hotdata sandbox. Previews the
+    `runtime/runner.py` against a fresh per-run Hotdata sandbox. Previews the
     uploaded tables on the host.
 
 Claude flow — `uv run python sandbox.py --with-prompt <prompt.md>`:
@@ -13,7 +13,8 @@ Claude flow — `uv run python sandbox.py --with-prompt <prompt.md>`:
     CLI commands for the resulting sandbox.
 
 Both flows share sandbox creation, env-threading, and the runner contract via
-`pipeline_runtime`.
+the `runtime` package — see `runtime/__init__.py` for why the runtime is split
+into a host half and an in-container half.
 """
 
 # mypy: disable-error-code="no-untyped-def,arg-type"
@@ -31,7 +32,7 @@ from typing import Sequence
 import dagger
 from dagger import dag
 
-from pipeline_runtime import (
+from runtime import (
     ClaudeImage,
     DatagenImage,
     HotdataSession,
@@ -162,7 +163,7 @@ class BaseFlow:
         agent_container = await self._build_agent_container(session, hotdata_secret)
         return Runner.mount_and_exec(
             agent_container,
-            host_file("container/runner.py"),
+            Runner.host_file(),
             owner=self.AGENT_OWNER,
         )
 
@@ -186,12 +187,14 @@ class BaseFlow:
         sys.stdout.write(f"sandbox:   {self.sandbox_name} ({sandbox_id})\n")
         sys.stdout.write(f"pipeline:  {summary['pipeline_name']}\n")
 
-        sys.stdout.write("\n=== Query the loaded data (run each query separately) ===\n")
+        sys.stdout.write(
+            "\n=== Query the loaded data (run each query separately) ===\n"
+        )
         for table in summary["tables"]:
             cols = ", ".join(str(c) for c in previews[table][0][:PREVIEW_COLS])
             sys.stdout.write("# ---\n")
             sys.stdout.write(
-                f'HOTDATA_SANDBOX={sandbox_id} hotdata query -w {workspace_id} '
+                f"HOTDATA_SANDBOX={sandbox_id} hotdata query -w {workspace_id} "
                 f'"SELECT {cols} FROM datasets.{sandbox_id}.{table} LIMIT 10"\n'
             )
 

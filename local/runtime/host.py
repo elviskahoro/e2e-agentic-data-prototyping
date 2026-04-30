@@ -1,16 +1,15 @@
-"""Host-side helpers used by `sandbox.py` for both the datagen flow and the Claude flow.
+"""Host half of the pipeline runtime.
 
-The two flows differ in whether Claude/Node tooling is layered on top, but they both:
+See `runtime/__init__.py` for why this is split from `runtime/runner.py`
+(short version: trust boundary — the agent must not be able to read the
+runner). This module runs on the host: it builds Dagger images, opens the
+Hotdata sandbox, threads env vars + secrets into the container, mounts the
+runner on the *post-agent* layer, and parses the runner's JSON summary.
 
-- create a Hotdata sandbox via the typed SDK and capture workspace + sandbox ids,
-- thread `HOTDATA_*` env vars + the api-key secret into a Dagger container,
-- mount the same `container/runner.py` that imports `source.py`, runs a dlt pipeline against an in-memory DuckDB, and uploads each user-facing arrow→parquet table to the sandbox,
-- parse the runner's last-stdout-line JSON summary.
-
-Helpers are grouped by the semantic entity they belong to: `Source` (the user-facing
-dlt script), `Runner` (the trusted in-container script), `HotdataSession` (the
-workspace+sandbox-scoped API client), and `DatagenImage` / `ClaudeImage` (the two
-container image builders). The entry script reads as orchestration, not plumbing.
+Helpers are grouped by the entity they belong to: `Source` (the user-facing
+dlt script), `Runner` (the host-side view of the trusted in-container script),
+`HotdataSession` (workspace + sandbox-scoped API client), and
+`DatagenImage` / `ClaudeImage` (the two image builders).
 """
 
 # mypy: disable-error-code="no-untyped-def,arg-type"
@@ -37,6 +36,9 @@ HOTDATA_PKG = "hotdata>=0.1.0,<0.2"
 # so an agent run can't see/edit it.
 WORKDIR = "/workspace"
 
+# Demo root on the host — `Path(__file__).parent` is `runtime/`, so go up one.
+DEMO_ROOT = Path(__file__).resolve().parent.parent
+
 
 class Source:
     """The user-facing dlt source script. Lives at `Source.PATH` inside `WORKDIR`, writable so the Claude flow can edit it in place."""
@@ -62,9 +64,21 @@ class Source:
 
 
 class Runner:
-    """The trusted in-container runner: imports `source.py`, runs a dlt pipeline against an in-memory DuckDB, and uploads each user-facing arrow→parquet table to the sandbox."""
+    """Host-side view of the trusted in-container runner (`runtime/runner.py`).
+
+    The runner imports `source.py`, runs a dlt pipeline against an in-memory
+    DuckDB, and uploads each user-facing arrow→parquet table to the sandbox.
+    The agent must never see it — see the package docstring for the trust
+    boundary that motivates the split.
+    """
 
     PATH = "/app/runner.py"
+    HOST_PATH = "runtime/runner.py"
+
+    @staticmethod
+    def host_file() -> dagger.File:
+        """The runner script as a `dagger.File`, resolved from the demo root."""
+        return host_file(Runner.HOST_PATH)
 
     @staticmethod
     def mount_and_exec(
@@ -190,7 +204,9 @@ class HotdataSession:
                     QueryRequest(sql=f"SELECT * FROM {qualified} LIMIT 0")
                 )
                 cols = list(schema_resp.columns)[:max_columns]
-                projection = ", ".join(f'"{c.replace(chr(34), chr(34) * 2)}"' for c in cols)
+                projection = ", ".join(
+                    f'"{c.replace(chr(34), chr(34) * 2)}"' for c in cols
+                )
             else:
                 projection = "*"
             sql = f"SELECT {projection} FROM {qualified} LIMIT {limit}"
@@ -200,9 +216,8 @@ class HotdataSession:
 
 
 def host_file(relpath: str) -> dagger.File:
-    """Resolve a path relative to this module's directory as a `dagger.File`."""
-    here = Path(__file__).resolve().parent
-    return dag.host().file(str(here / relpath))
+    """Resolve a path relative to the demo root as a `dagger.File`."""
+    return dag.host().file(str(DEMO_ROOT / relpath))
 
 
 class DatagenImage:
@@ -259,9 +274,7 @@ class ClaudeImage:
         output_format: str,
     ) -> tuple[dagger.Container, str]:
         """Returns `(container, claude_cmd)` — the caller threads hotdata env via `HotdataSession.inject_env`, execs `claude_cmd`, then mounts the runner on the post-Claude layer with `Runner.mount_and_exec(..., owner=ClaudeImage.AGENT_OWNER)`."""
-        venv_path_env = (
-            f"{ClaudeImage.VENV_PATH}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-        )
+        venv_path_env = f"{ClaudeImage.VENV_PATH}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         claude_cmd = (
             f'exec claude -p "$(cat {ClaudeImage.PROMPT_PATH})" '
             f"--model {model} "
@@ -333,7 +346,9 @@ class ClaudeImage:
                 ClaudeImage.PROMPT_PATH, prompt_file, owner=ClaudeImage.AGENT_OWNER
             )
             .with_(
-                lambda c: Source.copy_into(c, source_file, owner=ClaudeImage.AGENT_OWNER)
+                lambda c: Source.copy_into(
+                    c, source_file, owner=ClaudeImage.AGENT_OWNER
+                )
             )
             .with_secret_variable("ANTHROPIC_API_KEY", anthropic_secret)
         )

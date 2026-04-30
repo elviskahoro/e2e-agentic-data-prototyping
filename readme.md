@@ -1,54 +1,87 @@
 # Agentic Data Pipelining — Sandbox Demos
 
-Prototype for a **fully agentic data pipelining experience**: an agent writes a `dlt` source, spins up a containerized runtime, runs the pipeline against an in-memory DuckDB, and lands the resulting tables in a per-run Hotdata sandbox — all without leaving artifacts on the host. The same pipeline shape is workshopped against two container runtimes so we can feel the difference between **local** and **cloud/remote** execution.
+Prototype for a **fully agentic data pipelining experience**: an agent writes a `dlt` source, a host driver builds a container, runs the pipeline against an in-memory DuckDB, and lands the resulting tables in a per-run Hotdata sandbox. No artifacts on the host, no DuckDB file, no parquet on disk — bytes only ever live in RAM and on the wire.
+
+The point of two subfolders is to put the same pipeline shape against two container runtimes — **local** (Dagger) and **cloud / remote** (Modal) — so we can feel the difference between local iteration and remote execution.
+
+## Status — read this first
+
+| Path        | Runtime  | Status                                                                                  |
+| ----------- | -------- | --------------------------------------------------------------------------------------- |
+| `local/`    | Dagger   | **Done.** Two flows: a hand-written datagen source, plus a Claude-driven flow that lets an agent author `source.py` inside the container before a trusted runner uploads. |
+| `sandbox/`  | Modal    | **Work in progress.** Older single-flow port. Doesn't yet match the `local/` refactor — no trusted-runner / agent split, no Claude flow, no transcript persistence. |
+
+**Start with `local/`.** Treat `sandbox/` as a reference for what the Modal port looked like before the refactor — it still runs end-to-end, but the architecture has diverged and bringing it up to parity is on the TODO list.
+
+## If you're picking this up cold (or you're Claude Code)
+
+Read `local/readme.md`, then `local/sandbox.py` (single entry, two flows dispatched on `--with-prompt`), then `local/pipeline_runtime.py` (host-side helpers grouped by entity: `Source`, `Runner`, `HotdataSession`, `DatagenImage`, `ClaudeImage`). The in-container side is `local/container/runner.py` and the swappable payload is `local/source.py`.
+
+Before running anything:
+
+- `export HOTDATA_API_KEY=...` (both flows).
+- For the Claude flow only: `export ANTHROPIC_API_KEY=...`. Optionally `export GITHUB_TOKEN=...` (raises GitHub API rate limit from 60 → 5000 req/hr).
+- A working Docker / OrbStack runtime — Dagger pulls the base image and runs the container locally.
+- `uv` for Python package management.
+
+Then:
+
+```bash
+cd local
+uv sync
+
+# Datagen flow — runs the hand-written source.py with synthetic purchases + customers.
+uv run python sandbox.py
+
+# Claude flow — Claude rewrites /workspace/source.py inside the container, then the
+# trusted runner uploads whatever it left behind. Default prompt asks for a dlt
+# source over the top 10 starred GitHub repos for `elviskahoro`.
+uv run python sandbox.py --with-prompt prompt.md
+```
+
+Both flows print copy-pasteable `hotdata query` commands at the end so you can poke at the loaded tables. The Claude flow additionally persists the chat transcript to `local/data/<run_id>.jsonl` (replay it as markdown via `transcript_to_markdown.sh <path> | glow -`).
+
+## What's actually happening (local/)
+
+`local/sandbox.py` opens a Hotdata session, creates a fresh per-run sandbox, builds a Dagger container, and execs a trusted in-container `runner.py`. The runner imports `source.py`, runs the dlt pipeline against an **in-memory DuckDB**, converts each user-facing table to parquet bytes in a `BytesIO` buffer, and POSTs them straight to the Hotdata API. The host then queries the sandbox to print a preview.
+
+The two flows differ only in what's layered on top before the runner runs:
+
+- **Datagen flow** — minimal image (dlt + duckdb + pyarrow + Hotdata SDK). Runner runs as root. No agent in the loop.
+- **Claude flow** — datagen image *plus* Node + Claude Code + the dlt-ai toolkits (`rest-api-pipeline`, `data-exploration`). Claude is execed first, against `prompt.md`, and may rewrite `/workspace/source.py`. **The runner is mounted only on the post-Claude container layer**, so the agent never has filesystem access to it during its exec. Runs as an unprivileged `agent` user (Claude Code refuses `bypassPermissions` under root).
+
+The agent ↔ runner split is the security story: Claude has free rein over `/workspace/source.py`, but the upload code (which holds `HOTDATA_API_KEY`) lives at `/app/runner.py` on a layer Claude never sees.
+
+## Contract for `source.py`
+
+The runner reads exactly one symbol from `source.py`:
+
+- `source()` — a `@dlt.source(name=...)`-decorated callable returning a configured dlt source. The decorator's `name` doubles as both `pipeline_name` and `dataset_name` — one symbol, no out-of-band constants. The runner does `pipe.run(source())` and discovers the user-facing tables from `pipe.default_schema.tables`.
+
+Agents rewriting `source.py` only need to honor that contract; they don't write a `pipeline.py` and don't call `pipeline.run()`.
+
+## Layout
+
+```
+local/
+  sandbox.py             # single entry, dispatches on --with-prompt
+  pipeline_runtime.py    # host-side: Source, Runner, HotdataSession, DatagenImage, ClaudeImage
+  source.py              # canonical dlt source — the swappable payload
+  prompt.md              # example Claude task (top-10 starred repos)
+  container/runner.py    # trusted in-container runner; mounted at /app/runner.py
+  transcript_to_markdown.sh
+  data/                  # chat transcripts (gitignored)
+
+sandbox/                 # Modal port — older, WIP, see Status table above
+```
+
+In-container layout (Claude flow):
+
+- `/workspace/source.py` — writable, agent-editable.
+- `/workspace/prompt.md` — the user's prompt.
+- `/app/runner.py` — trusted runner, mounted *after* Claude exits.
 
 ## TODO
 
-- Prototype building a `dlt` source from a natural-language prompt with AI (replace the hand-written `source.py` with an agent-authored one).
-- Dispatch sub-agents using Modal Sandboxes + OpenAI's new Agent SDK to own the **author → review → test** loop for the dlt code: one sub-agent writes the source, another reviews it, and a third validates it by running the pipeline and loading into Hotdata.
-
-## The four pieces
-
-| Tool         | Role in the demo                                                                          |
-| ------------ | ----------------------------------------------------------------------------------------- |
-| **dlt**      | The pipeline itself. `source.py` is a swappable payload — the bit an agent would author.  |
-| **Hotdata**  | The destination. Each run creates a fresh Hotdata sandbox. dlt loads into an **in-memory DuckDB** (never on disk), tables are read back as arrow, serialized to parquet **in a `BytesIO` buffer** (also never on disk), and POSTed straight to `/v1/files` to be registered as datasets. The host then runs a verification query against the freshly-loaded tables. |
-| **Dagger**   | **Local** container runtime. Builds and runs the pipeline image on the developer's machine. See `local/`. |
-| **Modal**    | **Cloud / remote** container runtime. Same pipeline, executed on Modal Sandboxes — what the agent would use when the host machine isn't the right place to run the work. See `sandbox/`. |
-
-The split is the whole point: Dagger and Modal are deliberately interchangeable here so we can compare the local-iteration story against the remote-execution story side by side.
-
-## Subfolders
-
-### `local/` — Dagger driver (local container)
-
-Host driver `dlt_agent_sandbox_with_api.py` opens a Hotdata session, creates a sandbox, then uses Dagger to build a Python 3.13 image, install `dlt[duckdb]` + `pyarrow` + the Hotdata SDK, mount `source.py` and `container/entry.py` at `/app`, and exec the entry script. The container runs `dlt` against an in-memory DuckDB, converts each table to parquet bytes in-memory (`BytesIO`, never touching disk), and POSTs them to the Hotdata API. The host then queries the sandbox to print a preview.
-
-Run:
-```bash
-cd local && uv sync && uv run python dlt_agent_sandbox_with_api.py
-```
-
-### `sandbox/` — Modal driver (remote container)
-
-Same demo, ported to Modal Sandboxes. The host driver `dlt_agent_sandbox_with_modal.py` builds a Modal image (registry base + pip layer + source files added via `add_local_file`), spawns a single `modal.Sandbox`, waits for it to exit, then queries the resulting Hotdata sandbox for the preview. The container entry script creates the Hotdata sandbox itself and writes its id to stdout, so the host doesn't need to thread it through.
-
-Run:
-```bash
-cd sandbox && uv sync && uv run python dlt_agent_sandbox_with_modal.py
-```
-
-`sandbox/design/` holds the port spec, plan, and original prompt — useful as a worked example of "take this Dagger demo and make it run on Modal."
-
-## What's shared between the two
-
-- **`source.py`** — identical dlt source defining synthetic `purchases` and `customers` tables. This is the swappable payload an agent would replace.
-- **In-container entry script** (`local/container/entry.py`, `sandbox/dlt_agent_container_entry.py` — same content, different paths) — runs inside the container: dlt → **in-memory DuckDB** → arrow → parquet bytes in a `BytesIO` buffer → Hotdata API. **No filesystem writes at any stage** — no DuckDB file, no parquet file, no temp staging. The container is pure compute; bytes only ever live in RAM and on the wire. Prints exactly one JSON line on stdout (table names, plus sandbox id in the Modal version).
-- **Hotdata SDK pinned to a GitHub ref** — installed via `git+https://github.com/hotdata-dev/sdk-python` in both runtimes.
-
-## Prereqs
-
-- `HOTDATA_API_KEY` exported in your shell (both demos).
-- `uv` for Python package management.
-- **Dagger demo** (`local/`): a working Docker / OrbStack runtime — Dagger pulls the base image and runs the container locally.
-- **Modal demo** (`sandbox/`): one-time `modal token new` for CLI auth.
+- Bring `sandbox/` (Modal) up to parity with the `local/` refactor — trusted-runner split, Claude flow, transcript persistence, single-entry CLI.
+- Replace `prompt.md` with a higher-leverage author → review → test loop: dispatch sub-agents (Modal Sandboxes + OpenAI's Agent SDK, or equivalent) so one writes the source, another reviews it, and a third validates by running the pipeline and inspecting the loaded tables.
