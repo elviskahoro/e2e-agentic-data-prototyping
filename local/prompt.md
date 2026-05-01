@@ -4,10 +4,9 @@ Write a dlt source for the top 10 starred repositories of GitHub user `elviskaho
 
 ## Contract for `source.py`
 
-The runner imports your module and reads two names from it:
+The runner imports your module and reads one name from it:
 
-1. `PIPELINE_NAME: str` — module-level string constant. Use a stable slug like `"github_starred"`. The runner uses this as both `pipeline_name` and `dataset_name` when it constructs the `dlt.pipeline(...)`.
-2. `source()` — a callable returning a configured dlt source or resource. The runner does `pipe.run(source())`.
+- `source()` — a `@dlt.source(name=...)`-decorated callable. The decorator's `name` doubles as both `pipeline_name` and `dataset_name` when the runner constructs `dlt.pipeline(...)`. Use a stable slug like `"github_starred"`. The runner does `pipe.run(source())`.
 
 Example skeleton:
 
@@ -15,8 +14,7 @@ Example skeleton:
 import dlt
 from dlt.sources.rest_api import rest_api_source
 
-PIPELINE_NAME = "github_starred"
-
+@dlt.source(name="github_starred")
 def source():
     return rest_api_source({...})  # configured per the rules below
 ```
@@ -35,6 +33,6 @@ Use the dlt skills installed in this workspace to figure out the right shape (`f
 
 ## Done when
 
-- `/workspace/source.py` defines `PIPELINE_NAME` (str) and `source()` (callable).
+- `/workspace/source.py` defines `source()` decorated with `@dlt.source(name="...")`.
 - `source()` returns a dlt source/resource capped at one HTTP request and ≤10 rows.
 - You exit cleanly. The runner runs after you and is responsible for `pipeline.run()` + uploading to the Hotdata sandbox.
