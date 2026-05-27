@@ -189,6 +189,31 @@ class HotdataSession:
             .with_secret_variable("HOTDATA_API_KEY", api_key_secret)
         )
 
+    def ibis_connect(self, database_name: str):
+        """Return an `ibis.hotdata` connection bound to the managed database created for this sandbox.
+
+        Resolves the managed database id via the runtime client and passes it to
+        `ibis.hotdata.connect` so `con.table(name, database=("default", "public"))`
+        works without further wiring.
+        """
+        import ibis  # noqa: PLC0415  -- optional dep for the demo's ibis preview
+
+        runtime_client = RuntimeHotdataClient(
+            self._api_key, self.workspace_id, host=self.host
+        )
+        try:
+            db = runtime_client.resolve_managed_database(database_name)
+        finally:
+            runtime_client.close()
+
+        return ibis.hotdata.connect(
+            api_url=self.host,
+            token=self._api_key,
+            workspace_id=self.workspace_id,
+            session_id=self.sandbox_id or None,
+            database_id=db.id,
+        )
+
     def preview(
         self,
         *,

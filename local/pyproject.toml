@@ -7,7 +7,9 @@ dependencies = [
     "dagger-io>=0.20.6",
     "dlt[filesystem,parquet]>=1.25.0",
     "hotdata-dlt-destination>=0.3.0,<0.4",
-    "hotdata>=0.2.2,<0.3",
+    "hotdata-ibis>=0.1.3,<0.2",
+    "hotdata>=0.2.3,<0.3",
+    "ibis-framework>=10,<11",
     "opentelemetry-exporter-otlp-proto-grpc>=1.41.1",
     "pandas>=3.0.2",
 ]

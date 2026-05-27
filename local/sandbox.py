@@ -32,6 +32,7 @@ from typing import Sequence
 import dagger
 from dagger import dag
 
+from ibis_examples import run_examples as run_ibis_examples
 from runtime import (
     ClaudeImage,
     DatagenImage,
@@ -150,6 +151,15 @@ class BaseFlow:
             )
             workspace_id = session.workspace_id
             workspace_name = session.workspace_name
+
+            # Bonus surface: query the same tables through hotdata-ibis with
+            # Python expressions instead of raw SQL. Runs inside the session so
+            # the connection still has a live API client / sandbox header.
+            run_ibis_examples(
+                session=session,
+                database_name=self.sandbox_name,
+                tables=summary["tables"],
+            )
 
         self._print_output(
             workspace_id=workspace_id,
