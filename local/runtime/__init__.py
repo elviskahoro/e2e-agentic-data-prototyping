@@ -15,7 +15,7 @@ of a trust boundary:
   └──────────────────────┘         └──────────────────────────┘
 
 They cannot be merged: different processes, different dep sets (Dagger SDK
-vs dlt + duckdb + Hotdata SDK), and — most importantly — `runner.py` MUST
+vs dlt + the Hotdata destination + Hotdata SDK), and — most importantly — `runner.py` MUST
 not be visible to the agent.
 
 The trust boundary
@@ -29,7 +29,7 @@ By the time the runner exists in the filesystem, Claude has already exited.
 The contract
 ────────────
 Host → Runner (env vars, set by `HotdataSession.inject_env`):
-    HOTDATA_API_URL, HOTDATA_WORKSPACE_ID, HOTDATA_SANDBOX_ID,
+    HOTDATA_API_URL, HOTDATA_WORKSPACE, HOTDATA_DATABASE,
     HOTDATA_API_KEY (secret), DLT_RUN_ID
   + `/workspace/source.py` — writable, may have been edited by Claude.
 

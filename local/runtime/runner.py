@@ -15,8 +15,7 @@ Contract with /workspace/source.py:
 Read main() top-to-bottom:
   1. RunnerConfig.from_env()      — what the host handed us
   2. _load_user_source()          — import + validate /workspace/source.py
-  3. _run_pipeline()              — dlt → in-memory DuckDB
-  4. _land_tables()               — arrow → parquet → UploadsApi → DatasetsApi
+  3. _run_pipeline()              — dlt → Hotdata destination
   5. _emit_result()               — one JSON line to stdout (host parses this)
 
 Everything chatty goes to stderr; only the final JSON goes to stdout.
@@ -24,7 +23,6 @@ Everything chatty goes to stderr; only the final JSON goes to stdout.
 
 from __future__ import annotations
 
-import io
 import json
 import os
 import sys
@@ -32,15 +30,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import dlt
-import duckdb
-import pyarrow as pa
-import pyarrow.parquet as pq
-
-import hotdata
-from hotdata.api_client import ApiClient
-from hotdata.models.create_dataset_request import CreateDatasetRequest
-from hotdata.models.dataset_source import DatasetSource
-from hotdata.models.upload_dataset_source import UploadDatasetSource
+from hotdata_dlt_destination import hotdata_destination
 
 WORKSPACE = "/workspace"
 
@@ -50,12 +40,12 @@ WORKSPACE = "/workspace"
 
 @dataclass(frozen=True)
 class RunnerConfig:
-    """Everything the host passes in via env — Hotdata creds + per-run sandbox."""
+    """Everything the host passes in via env — Hotdata creds + pipeline metadata."""
 
     api_key: str
     host: str
-    workspace_id: str
-    sandbox_id: str
+    workspace: str
+    database_name: str
     run_id: str
 
     @classmethod
@@ -63,8 +53,8 @@ class RunnerConfig:
         return cls(
             api_key=os.environ["HOTDATA_API_KEY"],
             host=os.environ["HOTDATA_API_URL"],
-            workspace_id=os.environ["HOTDATA_WORKSPACE_ID"],
-            sandbox_id=os.environ["HOTDATA_SANDBOX_ID"],
+            workspace=os.environ["HOTDATA_WORKSPACE"],
+            database_name=os.environ["HOTDATA_DATABASE"],
             run_id=os.environ["DLT_RUN_ID"],
         )
 
@@ -111,18 +101,26 @@ def _log_secret_passthrough() -> None:
     )
 
 
-# ─── 3. dlt run against an in-memory DuckDB ────────────────────────────────
+# ─── 3. dlt run against the Hotdata destination ───────────────────────────
 
 
-def _run_pipeline(src: Any, *, run_id: str) -> tuple[Any, list[str]]:
-    """Run dlt into an in-memory DuckDB; return the pipeline + user-facing tables."""
+def _run_pipeline(src: Any, cfg: RunnerConfig) -> list[str]:
+    """Run dlt into Hotdata; return the user-facing tables."""
     pipeline_name = src.name
-    print(f"→ pipeline_name={pipeline_name} run_id={run_id}", file=sys.stderr)
-
-    db = duckdb.connect(":memory:")
+    print(
+        f"→ pipeline_name={pipeline_name} run_id={cfg.run_id} "
+        f"database={cfg.database_name}",
+        file=sys.stderr,
+    )
     pipe = dlt.pipeline(
         pipeline_name=pipeline_name,
-        destination=dlt.destinations.duckdb(db),
+        destination=hotdata_destination(
+            database_name=cfg.database_name,
+            declared_tables=list(src.selected_resources.keys()),
+            api_key=cfg.api_key,
+            workspace_id=cfg.workspace,
+            api_base_url=cfg.host,
+        ),
         dataset_name=pipeline_name,
     )
     info = pipe.run(src)
@@ -138,80 +136,7 @@ def _run_pipeline(src: Any, *, run_id: str) -> tuple[Any, list[str]]:
             f"pipeline '{pipeline_name}' produced no user-facing tables (only _dlt_*)"
         )
     print(f"→ user tables: {user_tables}", file=sys.stderr)
-    return pipe, user_tables
-
-
-# ─── 4. land each table in the per-run Hotdata sandbox ─────────────────────
-
-
-def _land_tables(
-    cfg: RunnerConfig, pipe: Any, tables: list[str]
-) -> list[dict[str, str]]:
-    """For each user table: arrow → parquet → upload → create_dataset (sandbox-scoped)."""
-    sdk_cfg = hotdata.Configuration(
-        api_key=cfg.api_key,
-        host=cfg.host,
-        workspace_id=cfg.workspace_id,
-        session_id=cfg.sandbox_id,
-    )
-    datasets: list[dict[str, str]] = []
-    with hotdata.ApiClient(sdk_cfg) as api_client:
-        # Residual until SDK adds `sandbox_id=` on Configuration; scopes
-        # dataset writes via X-Sandbox-Id (reads use session_id above).
-        api_client.set_default_header("X-Sandbox-Id", cfg.sandbox_id)
-
-        uploader = Uploader(api_client)
-        ds = pipe.dataset()
-        for table_name in tables:
-            datasets.append(
-                uploader.land(
-                    arrow_tbl=getattr(ds, table_name).arrow(),
-                    table_name=table_name,
-                    label=f"agent_{cfg.run_id}_{table_name}",
-                )
-            )
-    return datasets
-
-
-@dataclass
-class Uploader:
-    api_client: ApiClient
-
-    @staticmethod
-    def _arrow_to_parquet_bytes(arrow_tbl: pa.Table) -> bytes:
-        buf = io.BytesIO()
-        pq.write_table(arrow_tbl, buf)
-        return buf.getvalue()
-
-    def land(self, arrow_tbl: pa.Table, table_name: str, label: str) -> dict[str, str]:
-        payload = self._arrow_to_parquet_bytes(arrow_tbl)
-        print(
-            f"→ upload {table_name} rows={arrow_tbl.num_rows} bytes={len(payload)}",
-            file=sys.stderr,
-        )
-        upload = hotdata.UploadsApi(self.api_client).upload_file(
-            body=payload, streaming=False
-        )
-        resp = hotdata.DatasetsApi(self.api_client).create_dataset(
-            CreateDatasetRequest(
-                label=label,
-                table_name=table_name,
-                source=DatasetSource(
-                    UploadDatasetSource(upload_id=upload.id, format="parquet")
-                ),
-            )
-        )
-        print(
-            f"  dataset id={resp.id} schema={resp.schema_name} table={resp.table_name}",
-            file=sys.stderr,
-        )
-        return {
-            "table": table_name,
-            "label": label,
-            "dataset_id": resp.id,
-            "schema_name": resp.schema_name,
-            "table_name": resp.table_name,
-        }
+    return user_tables
 
 
 # ─── 5. result handoff back to the host ────────────────────────────────────
@@ -243,14 +168,8 @@ def _emit_result(
 def main() -> None:
     cfg = RunnerConfig.from_env()
     src = _load_user_source()
-    pipe, tables = _run_pipeline(src, run_id=cfg.run_id)
-    datasets = _land_tables(cfg, pipe, tables)
-    _emit_result(
-        pipeline_name=src.name,
-        run_id=cfg.run_id,
-        tables=tables,
-        datasets=datasets,
-    )
+    tables = _run_pipeline(src, cfg)
+    _emit_result(pipeline_name=src.name, run_id=cfg.run_id, tables=tables, datasets=[])
 
 
 if __name__ == "__main__":

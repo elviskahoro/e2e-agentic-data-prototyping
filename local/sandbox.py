@@ -143,7 +143,11 @@ class BaseFlow:
                 f"from pipeline '{summary['pipeline_name']}'",
                 file=sys.stderr,
             )
-            previews = session.preview(summary["tables"], max_columns=PREVIEW_COLS)
+            previews = session.preview(
+                database_name=self.sandbox_name,
+                tables=summary["tables"],
+                max_columns=PREVIEW_COLS,
+            )
             workspace_id = session.workspace_id
             workspace_name = session.workspace_name
 
@@ -194,8 +198,8 @@ class BaseFlow:
             cols = ", ".join(str(c) for c in previews[table][0][:PREVIEW_COLS])
             sys.stdout.write("# ---\n")
             sys.stdout.write(
-                f"HOTDATA_SANDBOX={sandbox_id} hotdata query -w {workspace_id} "
-                f'"SELECT {cols} FROM datasets.{sandbox_id}.{table} LIMIT 10"\n'
+                f'hotdata query "SELECT {cols} FROM {self.sandbox_name}.public.{table} LIMIT 10" '
+                f"-d {self.sandbox_name}\n"
             )
 
         sys.stdout.write("\n=== Preview ===\n")
@@ -223,7 +227,10 @@ class DatagenFlow(BaseFlow):
     ):
         container = DatagenImage.build(host_file("source.py"))
         return session.inject_env(
-            container, api_key_secret=hotdata_secret, run_id=self.run_id
+            container,
+            api_key_secret=hotdata_secret,
+            database_name=self.sandbox_name,
+            run_id=self.run_id,
         )
 
 
@@ -301,7 +308,10 @@ class ClaudeFlow(BaseFlow):
             output_format=self.output_format,
         )
         base = session.inject_env(
-            base, api_key_secret=hotdata_secret, run_id=self.run_id
+            base,
+            api_key_secret=hotdata_secret,
+            database_name=self.sandbox_name,
+            run_id=self.run_id,
         )
 
         # Claude runs first; the runner is mounted only on the post-Claude layer

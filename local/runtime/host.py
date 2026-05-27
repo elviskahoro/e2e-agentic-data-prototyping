@@ -26,10 +26,12 @@ from dagger import dag
 from hotdata.api_client import ApiClient
 from hotdata.models.create_sandbox_request import CreateSandboxRequest
 from hotdata.models.query_request import QueryRequest
+from hotdata_runtime.client import HotdataClient as RuntimeHotdataClient
 
 # Pinned in one place so both `pyproject.toml` and the in-container `uv pip install`
 # move together.
-HOTDATA_PKG = "hotdata>=0.1.0,<0.2"
+HOTDATA_PKG = "hotdata>=0.2.2,<0.3"
+HOTDATA_DLT_DESTINATION_PKG = "hotdata-dlt-destination>=0.3.0,<0.4"
 
 # Shared in-container layout: `source.py` lives in `WORKDIR` (where Claude works in
 # the agent flow); the trusted runner lands at `Runner.PATH` outside that workdir
@@ -113,7 +115,7 @@ class Runner:
 class HotdataSession:
     """Workspace-scoped Hotdata API client with sandbox + verify operations.
 
-    Used as a context manager: opens a bootstrap client to pick the active workspace, then a persistent workspace-scoped client. After `create_sandbox`, subsequent reads are scoped to that sandbox via `X-Session-Id` (typed `session_id=` on Configuration); writes still need a residual `X-Sandbox-Id` default header until the SDK ships a `sandbox_id=` kwarg.
+    Used as a context manager: opens a bootstrap client to pick the active workspace, then a persistent workspace-scoped client. The sandbox is still created for run grouping and for the existing workspace preview flow, but the dlt destination now writes into a managed database directly.
     """
 
     def __init__(self, api_key: str, host: str | None = None):
@@ -171,6 +173,7 @@ class HotdataSession:
         container: dagger.Container,
         *,
         api_key_secret: dagger.Secret,
+        database_name: str,
         run_id: str,
     ) -> dagger.Container:
         """Thread the env vars + secret the in-container runner reads.
@@ -180,14 +183,19 @@ class HotdataSession:
         """
         return (
             container.with_env_variable("HOTDATA_API_URL", self.host)
-            .with_env_variable("HOTDATA_WORKSPACE_ID", self.workspace_id)
-            .with_env_variable("HOTDATA_SANDBOX_ID", self.sandbox_id)
+            .with_env_variable("HOTDATA_WORKSPACE", self.workspace_id)
+            .with_env_variable("HOTDATA_DATABASE", database_name)
             .with_env_variable("DLT_RUN_ID", run_id)
             .with_secret_variable("HOTDATA_API_KEY", api_key_secret)
         )
 
     def preview(
-        self, tables: list[str], *, max_columns: int | None = None, limit: int = 10
+        self,
+        *,
+        database_name: str,
+        tables: list[str],
+        max_columns: int | None = None,
+        limit: int = 10,
     ) -> dict[str, list[list[object]]]:
         """Preview rows from each uploaded table to confirm the load.
 
@@ -196,22 +204,32 @@ class HotdataSession:
         Index 0 of each row list is the column header.
         """
         query_api = hotdata.QueryApi(self.api_client)
+        runtime_client = RuntimeHotdataClient(
+            self._api_key,
+            self.workspace_id,
+            host=self.host,
+        )
         results: dict[str, list[list[object]]] = {}
-        for table in sorted(set(tables)):
-            qualified = f"datasets.{self.sandbox_id}.{table}"
-            if max_columns is not None:
-                schema_resp = query_api.query(
-                    QueryRequest(sql=f"SELECT * FROM {qualified} LIMIT 0")
-                )
-                cols = list(schema_resp.columns)[:max_columns]
-                projection = ", ".join(
-                    f'"{c.replace(chr(34), chr(34) * 2)}"' for c in cols
-                )
-            else:
-                projection = "*"
-            sql = f"SELECT {projection} FROM {qualified} LIMIT {limit}"
-            resp = query_api.query(QueryRequest(sql=sql))
-            results[table] = [[*resp.columns]] + [list(r) for r in (resp.rows or [])]
+        try:
+            db = runtime_client.resolve_managed_database(database_name)
+            for table in sorted(set(tables)):
+                qualified = f'"default"."public"."{table}"'
+                if max_columns is not None:
+                    schema_resp = query_api.query(
+                        QueryRequest(sql=f"SELECT * FROM {qualified} LIMIT 0"),
+                        x_database_id=db.id,
+                    )
+                    cols = list(schema_resp.columns)[:max_columns]
+                    projection = ", ".join(
+                        f'"{c.replace(chr(34), chr(34) * 2)}"' for c in cols
+                    )
+                else:
+                    projection = "*"
+                sql = f"SELECT {projection} FROM {qualified} LIMIT {limit}"
+                resp = query_api.query(QueryRequest(sql=sql), x_database_id=db.id)
+                results[table] = [[*resp.columns]] + [list(r) for r in (resp.rows or [])]
+        finally:
+            runtime_client.close()
         return results
 
 
@@ -221,7 +239,7 @@ def host_file(relpath: str) -> dagger.File:
 
 
 class DatagenImage:
-    """Minimal image for the datagen flow: dlt[duckdb] + duckdb + pyarrow + hotdata, with `source.py` copied into `WORKDIR`. The runner runs as root since there's no agent involved."""
+    """Minimal image for the datagen flow: dlt + the Hotdata dlt destination, with `source.py` copied into `WORKDIR`. The runner runs as root since there's no agent involved."""
 
     @staticmethod
     def build(source_file: dagger.File) -> dagger.Container:
@@ -236,10 +254,9 @@ class DatagenImage:
                     "pip",
                     "install",
                     "--system",
-                    "dlt[duckdb]",
-                    "duckdb",
-                    "pyarrow",
+                    "dlt",
                     HOTDATA_PKG,
+                    HOTDATA_DLT_DESTINATION_PKG,
                 ]
             )
             .with_workdir(WORKDIR)
@@ -248,7 +265,7 @@ class DatagenImage:
 
 
 class ClaudeImage:
-    """Image for the Claude flow: Claude Code + Node + dlt[workspace] + dlt-ai toolkits, plus a writable `source.py` and the user's prompt mounted at `ClaudeImage.PROMPT_PATH`.
+    """Image for the Claude flow: Claude Code + Node + dlt[workspace] + dlt-ai toolkits, plus the Hotdata dlt destination, a writable `source.py`, and the user's prompt mounted at `ClaudeImage.PROMPT_PATH`.
 
     The Claude Code CLI refuses bypassPermissions under root, so this image runs
     as an unprivileged `agent` user with its own venv. The datagen flow doesn't
@@ -333,9 +350,8 @@ class ClaudeImage:
                     "pip",
                     "install",
                     "dlt[workspace]",
-                    "duckdb",
-                    "pyarrow",
                     HOTDATA_PKG,
+                    HOTDATA_DLT_DESTINATION_PKG,
                 ]
             )
             .with_exec(["dlt", "ai", "init", "--agent=claude"])
