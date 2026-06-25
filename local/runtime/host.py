@@ -103,7 +103,7 @@ class Runner:
 
     @staticmethod
     def parse_summary(stdout: str) -> dict[str, Any]:
-        """Runner's last stdout line is JSON: {pipeline_name, run_id, tables, datasets}."""
+        """Runner's last stdout line is JSON: {pipeline_name, run_id, database_id, tables, datasets}."""
         last = stdout.strip().splitlines()[-1] if stdout.strip() else ""
         if not last.startswith("{"):
             raise RuntimeError(

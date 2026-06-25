@@ -31,6 +31,8 @@ from typing import Any
 
 import dlt
 from hotdata_dlt_destination import hotdata_destination
+from hotdata_dlt_destination.contracts import TableContract
+from hotdata_runtime.client import HotdataClient as RuntimeClient
 
 WORKSPACE = "/workspace"
 
@@ -104,19 +106,55 @@ def _log_secret_passthrough() -> None:
 # ─── 3. dlt run against the Hotdata destination ───────────────────────────
 
 
-def _run_pipeline(src: Any, cfg: RunnerConfig) -> list[str]:
-    """Run dlt into Hotdata; return the user-facing tables."""
+def _create_managed_database(cfg: RunnerConfig, declared_tables: list[str]) -> str:
+    """Create the managed database the destination will load into; return its id.
+
+    The id — not the human-readable name — is what the rest of the run keys off,
+    deliberately: the Hotdata API does not round-trip a database's `description`,
+    so a name-based `resolve_managed_database` lookup never matches. Creating the
+    database here once and threading its id means the destination resolves the
+    same database by its direct-id path on every per-table call (one database per
+    run, instead of spawning a fresh duplicate per table), and the host can
+    resolve the very same database for its post-run preview.
+
+    Tables are declared up front because the API rejects a load into a table that
+    was never declared at creation. They are normalized with the destination's own
+    `TableContract` logic so the declared names match the tables the destination
+    ultimately loads. `description` is set to the human-readable name for display
+    only — never for lookup.
+    """
+    table_decls = TableContract.declared_table_names(
+        database_name=cfg.database_name,
+        schema="public",
+        table_names=declared_tables,
+    )
+    runtime_client = RuntimeClient(cfg.api_key, cfg.workspace, host=cfg.host)
+    try:
+        db = runtime_client.create_managed_database(
+            description=cfg.database_name,
+            schema="public",
+            tables=table_decls,
+        )
+    finally:
+        runtime_client.close()
+    return db.id
+
+
+def _run_pipeline(src: Any, cfg: RunnerConfig) -> tuple[str, list[str]]:
+    """Run dlt into Hotdata; return (database_id, user-facing tables)."""
     pipeline_name = src.name
+    declared_tables = sorted(src.selected_resources.keys())
+    database_id = _create_managed_database(cfg, declared_tables)
     print(
         f"→ pipeline_name={pipeline_name} run_id={cfg.run_id} "
-        f"database={cfg.database_name}",
+        f"database={cfg.database_name} database_id={database_id}",
         file=sys.stderr,
     )
     pipe = dlt.pipeline(
         pipeline_name=pipeline_name,
         destination=hotdata_destination(
-            database_name=cfg.database_name,
-            declared_tables=list(src.selected_resources.keys()),
+            database_name=database_id,
+            declared_tables=declared_tables,
             api_key=cfg.api_key,
             workspace_id=cfg.workspace,
             api_base_url=cfg.host,
@@ -136,7 +174,7 @@ def _run_pipeline(src: Any, cfg: RunnerConfig) -> list[str]:
             f"pipeline '{pipeline_name}' produced no user-facing tables (only _dlt_*)"
         )
     print(f"→ user tables: {user_tables}", file=sys.stderr)
-    return user_tables
+    return database_id, user_tables
 
 
 # ─── 5. result handoff back to the host ────────────────────────────────────
@@ -146,6 +184,7 @@ def _emit_result(
     *,
     pipeline_name: str,
     run_id: str,
+    database_id: str,
     tables: list[str],
     datasets: list[dict[str, str]],
 ) -> None:
@@ -155,6 +194,7 @@ def _emit_result(
             {
                 "pipeline_name": pipeline_name,
                 "run_id": run_id,
+                "database_id": database_id,
                 "tables": tables,
                 "datasets": datasets,
             }
@@ -168,8 +208,14 @@ def _emit_result(
 def main() -> None:
     cfg = RunnerConfig.from_env()
     src = _load_user_source()
-    tables = _run_pipeline(src, cfg)
-    _emit_result(pipeline_name=src.name, run_id=cfg.run_id, tables=tables, datasets=[])
+    database_id, tables = _run_pipeline(src, cfg)
+    _emit_result(
+        pipeline_name=src.name,
+        run_id=cfg.run_id,
+        database_id=database_id,
+        tables=tables,
+        datasets=[],
+    )
 
 
 if __name__ == "__main__":

@@ -139,13 +139,19 @@ class BaseFlow:
                 runner_stdout = await runner_container.stdout()
 
             summary = Runner.parse_summary(runner_stdout)
+            # The runner reports the managed database it created by *id*, not by
+            # the human-readable sandbox name: the Hotdata API doesn't round-trip
+            # a database's description, so only the id resolves. Use it for every
+            # post-run lookup below.
+            database_id = summary["database_id"]
             print(
                 f"→ runner uploaded {len(summary['tables'])} tables "
-                f"from pipeline '{summary['pipeline_name']}'",
+                f"from pipeline '{summary['pipeline_name']}' "
+                f"into database {database_id}",
                 file=sys.stderr,
             )
             previews = session.preview(
-                database_name=self.sandbox_name,
+                database_name=database_id,
                 tables=summary["tables"],
                 max_columns=PREVIEW_COLS,
             )
@@ -157,7 +163,7 @@ class BaseFlow:
             # the connection still has a live API client / sandbox header.
             run_ibis_examples(
                 session=session,
-                database_name=self.sandbox_name,
+                database_name=database_id,
                 tables=summary["tables"],
             )
 
@@ -165,6 +171,7 @@ class BaseFlow:
             workspace_id=workspace_id,
             workspace_name=workspace_name,
             sandbox_id=sandbox_id,
+            database_id=database_id,
             summary=summary,
             previews=previews,
         )
@@ -193,23 +200,27 @@ class BaseFlow:
         workspace_id: str,
         workspace_name: str,
         sandbox_id: str,
+        database_id: str,
         summary: dict,
         previews: dict[str, list[list[object]]],
     ) -> None:
         sys.stdout.write("\n=== Hotdata sandbox ===\n")
         sys.stdout.write(f"workspace: {workspace_name} ({workspace_id})\n")
         sys.stdout.write(f"sandbox:   {self.sandbox_name} ({sandbox_id})\n")
+        sys.stdout.write(f"database:  {database_id}\n")
         sys.stdout.write(f"pipeline:  {summary['pipeline_name']}\n")
 
         sys.stdout.write(
             "\n=== Query the loaded data (run each query separately) ===\n"
         )
+        # Scope each query to the managed database by id (`-d`); inside that scope
+        # tables live under the built-in `default.public` catalog.
         for table in summary["tables"]:
             cols = ", ".join(str(c) for c in previews[table][0][:PREVIEW_COLS])
             sys.stdout.write("# ---\n")
             sys.stdout.write(
-                f'hotdata query "SELECT {cols} FROM {self.sandbox_name}.public.{table} LIMIT 10" '
-                f"-d {self.sandbox_name}\n"
+                f'hotdata query "SELECT {cols} FROM default.public.{table} LIMIT 10" '
+                f"-d {database_id}\n"
             )
 
         sys.stdout.write("\n=== Preview ===\n")
